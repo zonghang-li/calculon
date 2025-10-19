@@ -90,7 +90,7 @@ class AllExecutions(calculon.CommandLine):
     num_nets = syst.num_networks
     count = 0
     for tp in Llm.get_all_tensor_parallelisms(
-        num_procs, app.hidden, app.attn_heads):
+        num_procs, app.hidden, app.attn_heads, app.kv_groups):
       for pp in Llm.get_all_pipeline_parallelisms(
           num_procs, tp, app.num_blocks):
         dp = Llm.get_data_parallelism(num_procs, tp, pp)

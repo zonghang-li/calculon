@@ -59,11 +59,11 @@ class System:
     assert datatype in System.TypeSizes, f'Unsupported data type: {datatype}'
     self.datatype = datatype
 
-  def get_matrix_throughput(self, flops):
-    return self.matrix.throughput(self.datatype, flops)
+  def get_matrix_throughput(self, batch, m, n, k):
+    return self.matrix.throughput(self.datatype, batch=batch, m=m, n=n, k=k)
 
   def get_vector_throughput(self, flops):
-    return self.vector.throughput(self.datatype, flops)
+    return self.vector.throughput(self.datatype, flops=flops)
 
   def get_mem1_throughput(self, size):
     return self.mem1.throughput(size)

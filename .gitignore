@@ -36,3 +36,10 @@ nosetests.xml
 .mr.developer.cfg
 .project
 .pydevproject
+
+# IDEs
+.idea
+
+# Output and local configuration files
+output
+scripts/micro_benchmarks/*.json

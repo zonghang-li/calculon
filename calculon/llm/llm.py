@@ -18,7 +18,6 @@
 from calculon import *
 from .layers import *
 
-
 class Llm:
   """
   This implements the transformer with tensor, pipeline, and data parallelism.
@@ -36,19 +35,20 @@ class Llm:
       self.feedforward = cfg['feedforward']
       self.seq_size = cfg['seq_size']
       self.attn_heads = cfg['attn_heads']
+      self.kv_groups = cfg.get('kv_groups', self.attn_heads)
       self.attn_size = cfg['attn_size']
       self.num_blocks = cfg['num_blocks']
 
     def num_parameters(self):
       # https://cs.stanford.edu/~matei/papers/2021/sc_megatron_lm.pdf
       # Equation 2
-      p = 2 * self.hidden * self.feedforward                   # MLP weights
-      p += 4 * self.hidden * self.attn_heads * self.attn_size  # Attn weights
-      p += self.hidden + self.feedforward                      # biases MLP
-      p += 3 * self.attn_heads * self.attn_size + self.hidden  # biases Attn
-      p += 2 * 2 * self.hidden                                 # layer norm
-      p *= self.num_blocks                                     # per each block
-      p += (51200 + self.seq_size) * self.hidden               # embeddings
+      p = 2 * self.hidden * self.feedforward                                          # MLP weights
+      p += self.hidden * (2 * self.attn_heads + 2 * self.kv_groups) * self.attn_size  # Attn weights
+      p += self.hidden + self.feedforward                                             # biases MLP
+      p += (2 * self.kv_groups + self.attn_heads) * self.attn_size + self.hidden      # biases Attn
+      p += 2 * 2 * self.hidden                                                        # layer norm
+      p *= self.num_blocks                                                            # per each block
+      p += (51200 + self.seq_size) * self.hidden                                      # embeddings
       return p
 
   class Execution:
@@ -59,21 +59,23 @@ class Llm:
       return (
         'num_procs', 'tensor_par', 'pipeline_par', 'data_par', 'tensor_par_net',
         'pipeline_par_net', 'data_par_net', 'batch_size', 'microbatch_size',
-        'datatype', 'fused_activation', 'attention_type', 'activation_recompute',
-        'pipeline_interleaving', 'optimizer_sharding', 'tensor_par_comm_type',
-        'tensor_par_overlap', 'seq_par_ag_redo', 'data_par_overlap',
-        'weight_offload', 'activations_offload', 'optimizer_offload', 'training')
+        'datatype', 'fused_activation', 'qkv_packing', 'attention_type',
+        'activation_recompute', 'pipeline_interleaving', 'optimizer_sharding',
+        'tensor_par_comm_type', 'tensor_par_overlap', 'seq_par_ag_redo',
+        'data_par_overlap', 'weight_offload', 'activations_offload',
+        'optimizer_offload', 'training')
 
     @staticmethod
     def from_json(cfg):
+      cfg.setdefault('qkv_packing', True)
       assert set(cfg.keys()) == set(Llm.Execution.fields())
       values = [cfg[field] for field in Llm.Execution.fields()]
       return Llm.Execution(*values)
 
     def __init__(self, num_procs, tensor_par, pipeline_par, data_par,
                  tensor_par_net, pipeline_par_net, data_par_net,
-                 batch_size, microbatch_size, datatype,
-                 fused_activation, attention_type, activation_recompute,
+                 batch_size, microbatch_size, datatype, fused_activation,
+                 qkv_packing, attention_type, activation_recompute,
                  pipeline_interleaving, optimizer_sharding,
                  tensor_par_comm_type, tensor_par_overlap,
                  seq_par_ag_redo, data_par_overlap, weight_offload,
@@ -102,8 +104,9 @@ class Llm:
       self._num_microbatches = self._local_batch_size // self.microbatch_size
       self.datatype = datatype
       self.fused_activation = fused_activation
+      self.qkv_packing = bool(qkv_packing)
       self.attention_type = attention_type
-      assert self.attention_type in ['multihead', 'multiquery']
+      assert self.attention_type in ['multihead', 'multiquery', 'groupquery']
       self.activation_recompute = activation_recompute
       assert self.activation_recompute in ['full', 'attn_only', 'none']
       if self.activation_recompute in ['full', 'attn_only']:
@@ -149,10 +152,11 @@ class Llm:
       values = [
         self.num_procs, self.tensor_par, self.pipeline_par, self.data_par, self.tensor_par_net,
         self.pipeline_par_net, self.data_par_net, self.global_batch_size, self.microbatch_size,
-        self.datatype, self.fused_activation, self.attention_type, self.activation_recompute,
-        self.pipeline_interleaving, self.optimizer_sharding, self.tensor_par_comm_type,
-        self.tensor_par_overlap, self.seq_par_ag_redo, self.data_par_overlap,
-        self.weight_offload, self.activations_offload, self.optimizer_offload, self.training
+        self.datatype, self.fused_activation, self.qkv_packing, self.attention_type,
+        self.activation_recompute, self.pipeline_interleaving, self.optimizer_sharding,
+        self.tensor_par_comm_type, self.tensor_par_overlap, self.seq_par_ag_redo,
+        self.data_par_overlap, self.weight_offload, self.activations_offload,
+        self.optimizer_offload, self.training
       ]
       assert len(keys) == len(values)
       return dict(zip(keys, values))
@@ -209,9 +213,9 @@ class Llm:
         yield cand
 
   @staticmethod
-  def get_all_tensor_parallelisms(num_procs, hidden, attn_heads):
+  def get_all_tensor_parallelisms(num_procs, hidden, attn_heads, kv_groups):
     for cand in Llm._factors(num_procs):
-      if hidden % cand == 0 and attn_heads % cand == 0:
+      if hidden % cand == 0 and attn_heads % cand == 0 and kv_groups % cand == 0:
         yield cand
 
   @staticmethod
@@ -684,79 +688,119 @@ class Llm:
         conjugate=False,
         in_network_reduction=self.exe.in_network_reduction,
         needs_recomm=recompute_ag_flag))
-      self._llm_block.append(Fork(
-        "AttnBlock_Multihead_Fork",
-        self.sys,
-        self._activation_size,
-        3,
-        needs_recompute=recompute_ag_flag,
-        # With seq_par, we use activations from Comm layers to reflect that
-        # they're split, otherwise we keep full size activations
-        activation_stored=(not recompute_ag_flag)))
-      self._llm_block.append(Linear(
-        "AttnBlock_Query",
-        self.sys,
-        self._batch_seq,
-        self.app.hidden,
-        self.app.attn_heads * self.app.attn_size // self.exe.tensor_par,
-        needs_recompute=recompute_flag,
-        # Activation is stored in Fork instead,
-        activation_stored=False,
-        activation_reused=True))
-      if self.exe.attention_type == 'multihead':
-        self._llm_block.append(Linear(
-          "AttnBlock_Key",
-          self.sys,
-          self._batch_seq,
-          self.app.hidden,
-          self.app.attn_heads * self.app.attn_size // self.exe.tensor_par,
-          needs_recompute=recompute_flag,
-          # Activation is stored in Fork instead,
-          activation_stored=False,
-          activation_reused=True))
-        self._llm_block.append(Linear(
-          "AttnBlock_Value",
-          self.sys,
-          self._batch_seq,
-          self.app.hidden,
-          self.app.attn_heads * self.app.attn_size // self.exe.tensor_par,
-          needs_recompute=recompute_flag,
-          # Activation is stored in Fork instead,
-          activation_stored=False,
-          activation_reused=True))
-      elif self.exe.attention_type == 'multiquery':
-        # Multiqueri attention uses the same K, V for all "heads" resulting in
-        # smaller Wk and Wv, less matmul, faster inference
-        self._llm_block.append(Linear(
-          "AttnBlock_Key",
-          self.sys,
-          self._batch_seq,
-          self.app.hidden,
-          self.app.attn_size,
-          needs_recompute=recompute_flag,
-          # Activation is stored in Fork instead,
-          activation_stored=False,
-          activation_reused=True))
-        self._llm_block.append(Linear(
-          "AttnBlock_Value",
-          self.sys,
-          self._batch_seq,
-          self.app.hidden,
-          self.app.attn_size,
-          needs_recompute=recompute_flag,
-          # Activation is stored in Fork instead,
-          activation_stored=False,
-          activation_reused=True))
+      if self.exe.qkv_packing:
+        assert self.exe.attention_type != 'multiquery', \
+          "Multiquery attention does not support qkv packing"
+        if self.exe.attention_type in ['multihead', 'groupquery']:
+          assert not (self.exe.attention_type == 'multihead' and self.app.kv_groups != self.app.attn_heads), \
+            "kv_groups must be equal to attn_heads for multihead attention"
+          assert self.app.attn_heads % self.app.kv_groups == 0, "Number of heads must be divisible by kv_groups"
+          assert self.app.kv_groups % self.exe.tensor_par == 0, "kv_groups must be divisible by tensor_par"
+          self._llm_block.append(Linear(
+            "AttnBlock_QKV",
+            self.sys,
+            self.exe.microbatch_size,
+            self.app.seq_size,
+            self.app.hidden,
+            (self.app.attn_heads + 2 * self.app.kv_groups) * self.app.attn_size // self.exe.tensor_par,
+            needs_recompute=recompute_flag,
+            # Fork removed -> QKV must claim input-activation storage
+            activation_stored=(not recompute_ag_flag),
+            activation_reused=False
+          ))
+        # View op is zero-FLOP, it shouldn't add cost, so we just ignore it.
+        else:
+          raise self.Error('Wrong attention type', self.exe.attention_type)
       else:
-        raise self.Error('Wrong attention type', self.exe.attention_type)
+        self._llm_block.append(Fork(
+          "AttnBlock_Multihead_Fork",
+          self.sys,
+          self._activation_size,
+          3,
+          needs_recompute=recompute_ag_flag,
+          # With seq_par, we use activations from Comm layers to reflect that
+          # they're split, otherwise we keep full size activations
+          activation_stored=(not recompute_ag_flag)))
+        self._llm_block.append(Linear(
+          "AttnBlock_Query",
+          self.sys,
+          self.exe.microbatch_size,
+          self.app.seq_size,
+          self.app.hidden,
+          self.app.attn_heads * self.app.attn_size // self.exe.tensor_par,
+          needs_recompute=recompute_flag,
+          # Activation is stored in Fork instead,
+          activation_stored=False,
+          activation_reused=True))
+        if self.exe.attention_type in ['multihead', 'groupquery']:
+          assert not (self.exe.attention_type == 'multihead' and self.app.kv_groups != self.app.attn_heads), \
+            "kv_groups must be equal to attn_heads for multihead attention"
+          assert self.app.attn_heads % self.app.kv_groups == 0, "Number of heads must be divisible by kv_groups"
+          assert self.app.kv_groups % self.exe.tensor_par == 0, "kv_groups must be divisible by tensor_par"
+          self._llm_block.append(Linear(
+            "AttnBlock_Key",
+            self.sys,
+            self.exe.microbatch_size,
+            self.app.seq_size,
+            self.app.hidden,
+            self.app.kv_groups * self.app.attn_size // self.exe.tensor_par,
+            needs_recompute=recompute_flag,
+            # Activation is stored in Fork instead,
+            activation_stored=False,
+            activation_reused=True))
+          self._llm_block.append(Linear(
+            "AttnBlock_Value",
+            self.sys,
+            self.exe.microbatch_size,
+            self.app.seq_size,
+            self.app.hidden,
+            self.app.kv_groups * self.app.attn_size // self.exe.tensor_par,
+            needs_recompute=recompute_flag,
+            # Activation is stored in Fork instead,
+            activation_stored=False,
+            activation_reused=True))
+        elif self.exe.attention_type == 'multiquery':
+          # Multiqueri attention uses the same K, V for all "heads" resulting in
+          # smaller Wk and Wv, less matmul, faster inference
+          self._llm_block.append(Linear(
+            "AttnBlock_Key",
+            self.sys,
+            self.exe.microbatch_size,
+            self.app.seq_size,
+            self.app.hidden,
+            self.app.attn_size,
+            needs_recompute=recompute_flag,
+            # Activation is stored in Fork instead,
+            activation_stored=False,
+            activation_reused=True))
+          self._llm_block.append(Linear(
+            "AttnBlock_Value",
+            self.sys,
+            self.exe.microbatch_size,
+            self.app.seq_size,
+            self.app.hidden,
+            self.app.attn_size,
+            needs_recompute=recompute_flag,
+            # Activation is stored in Fork instead,
+            activation_stored=False,
+            activation_reused=True))
+        else:
+          raise self.Error('Wrong attention type', self.exe.attention_type)
     else:
-      if self.exe.attention_type == 'multihead':
+      # LinearOverlapped already models QKV packing
+      if self.exe.attention_type in ['multihead', 'groupquery']:
+        assert not (self.exe.attention_type == 'multihead' and self.app.kv_groups != self.app.attn_heads), \
+          "kv_groups must be equal to attn_heads for multihead attention"
+        assert self.app.attn_heads % self.app.kv_groups == 0, "Number of heads must be divisible by kv_groups"
+        k_packed = (self.app.attn_heads + 2 * self.app.kv_groups) * self.app.attn_size
+        assert k_packed % self.exe.tensor_par == 0, "Packed QKV out-features must shard evenly across TP"
         self._llm_block.append(LinearOverlapped(
           "AttnBlock_QKV_AG",
           self.sys,
-          self._batch_seq,
+          self.exe.microbatch_size,
+          self.app.seq_size,
           self.app.hidden,
-          self.app.attn_heads * self.app.attn_size *3,          # Q, K, V
+          k_packed,
           self.exe.tensor_par_comm_type,
           self.exe.tensor_par,
           self.exe.tensor_par_net,
@@ -769,7 +813,8 @@ class Llm:
         self._llm_block.append(LinearOverlapped(
           "AttnBlock_Query_AG",
           self.sys,
-          self._batch_seq,
+          self.exe.microbatch_size,
+          self.app.seq_size,
           self.app.hidden,
           self.app.attn_heads * self.app.attn_size,
           self.exe.tensor_par_comm_type,
@@ -792,7 +837,8 @@ class Llm:
         self._llm_block.append(Linear(
           "AttnBlock_Key",
           self.sys,
-          self._batch_seq,
+          self.exe.microbatch_size,
+          self.app.seq_size,
           self.app.hidden,
           self.app.attn_size,
           needs_recompute=recompute_flag,
@@ -802,7 +848,8 @@ class Llm:
         self._llm_block.append(Linear(
           "AttnBlock_Value",
           self.sys,
-          self._batch_seq,
+          self.exe.microbatch_size,
+          self.app.seq_size,
           self.app.hidden,
           self.app.attn_size,
           needs_recompute=recompute_flag,
@@ -811,13 +858,15 @@ class Llm:
           activation_reused=True))
       else:
         raise self.Error('Wrong attention type', self.exe.attention_type)
-    self._llm_block.append(BatchMatMul(
+    self._llm_block.append(BatchMatMulGQA(
       "AttnBlock_Multihead_Key_Query",
       self.sys,
       self.exe.microbatch_size * self.app.attn_heads // self.exe.tensor_par,
       self.app.seq_size,
       self.app.attn_size,
       self.app.seq_size,
+      shared_operand='b',
+      reuse_ratio=self.app.kv_groups / self.app.attn_heads,
       needs_recompute=recompute_attn_flag,
       output_stored=(not recompute_attn_flag)))
     self._llm_block.append(SoftMax(
@@ -826,27 +875,32 @@ class Llm:
       self.app.attn_heads // self.exe.tensor_par * \
         self.app.seq_size**2 * self.exe.microbatch_size,
       needs_recompute=recompute_attn_flag,
-      output_stored=(not recompute_attn_flag)))
+      output_stored=(not recompute_attn_flag)
+    ))
     self._llm_block.append(DropOut(
       "AttnBlock_Multihead_DropOut",
       self.sys,
       self.app.attn_heads // self.exe.tensor_par * \
         self.app.seq_size**2 * self.exe.microbatch_size,
       needs_recompute=recompute_attn_flag,
-      activation_stored=(not recompute_attn_flag)))
-    self._llm_block.append(BatchMatMul(
+      activation_stored=(not recompute_attn_flag)
+    ))
+    self._llm_block.append(BatchMatMulGQA(
       "AttnBlock_Multihead_Attn",
       self.sys,
       self.exe.microbatch_size * self.app.attn_heads // self.exe.tensor_par,
       self.app.seq_size,
       self.app.seq_size,
-      self.app.attn_heads * self.app.attn_size // self.app.attn_heads,
+      self.app.attn_size,
+      shared_operand='b',
+      reuse_ratio=self.app.kv_groups / self.app.attn_heads,
       needs_recompute=recompute_flag))
     if self.exe.tensor_par_overlap == 'none':
       self._llm_block.append(Linear(
         "AttnBlock_MLP",
         self.sys,
-        self._batch_seq,
+        self.exe.microbatch_size,
+        self.app.seq_size,
         self.app.attn_heads * self.app.attn_size // self.exe.tensor_par,
         self.app.hidden,
         needs_recompute=recompute_flag))
@@ -869,7 +923,8 @@ class Llm:
       self._llm_block.append(LinearOverlapped(
         "AttnBlock_MLP_RS",
         self.sys,
-        self._batch_seq,
+        self.exe.microbatch_size,
+        self.app.seq_size,
         self.app.attn_heads * self.app.attn_size,
         self.app.hidden,
         self.exe.tensor_par_comm_type,
@@ -940,7 +995,8 @@ class Llm:
       self._llm_block.append(Linear(
         "MlpBlock_Mlp1",
         self.sys,
-        self._batch_seq,
+        self.exe.microbatch_size,
+        self.app.seq_size,
         self.app.hidden,
         self.app.feedforward // self.exe.tensor_par,
         needs_recompute=recompute_flag,
@@ -951,7 +1007,8 @@ class Llm:
       self._llm_block.append(LinearOverlapped(
         "MlpBlock_Mlp1_AG",
         self.sys,
-        self._batch_seq,
+        self.exe.microbatch_size,
+        self.app.seq_size,
         self.app.hidden,
         self.app.feedforward,
         self.exe.tensor_par_comm_type,
@@ -972,7 +1029,8 @@ class Llm:
       self._llm_block.append(Linear(
         "MlpBlock_Mlp2",
         self.sys,
-        self._batch_seq,
+        self.exe.microbatch_size,
+        self.app.seq_size,
         self.app.feedforward // self.exe.tensor_par,
         self.app.hidden,
         needs_recompute=recompute_flag))
@@ -995,7 +1053,8 @@ class Llm:
       self._llm_block.append(LinearOverlapped(
         "MlpBlock_Mlp2_RS",
         self.sys,
-        self._batch_seq,
+        self.exe.microbatch_size,
+        self.app.seq_size,
         self.app.feedforward,
         self.app.hidden,
         self.exe.tensor_par_comm_type,
@@ -1130,7 +1189,22 @@ class Llm:
     This only computes flops, flop time, and communication sizes. Since
     tensor and pipeline parallelism cause different communication operations to
     occur at the full batch level, the communication times are computed later.
+
+    For one transformer block and one microbatch, it aggregates:
+      Compute: FLOPs and their time for FW, BW (agrad + wgrad), recompute, and optimizer.
+      Memory: bytes accessed and time per stage.
+      TP comm: per‑stage sizes, link time, and exposed time for both base blocks and edge blocks
+        (used later by the pipeline schedule).
+      PP comm size for FW and BW (time is not computed here).
+      Memory footprint: weights, grads, activations (working vs. stored), optimizer state.
+      Overlap metric: the TP bandwidth required to fully hide TP collectives under compute.
+    All of these are saved in self._block_* / self._baseblock_* / self._edgeblock_* fields for
+      subsequent top‑level aggregation.
     """
+
+    # If we’re training with full activation recompute, the checkpointed bytes per block are
+    # act_size * bytes_per_element, otherwise 0. This represents the per‑block activation
+    # explicitly kept when recomputing everything else during BW.
     if self.exe.training and self.exe.activation_recompute == "full":
       self._block_act_checkpoint_size = \
         self._activation_size * self._bytes_per_element
@@ -1138,151 +1212,185 @@ class Llm:
       self._block_act_checkpoint_size = 0
 
     # Initializes values to zero for accumulation in layer loop
-    self._block_fw_flops = 0
-    self._block_fw_flops_time = 0
-    self._block_fw_mem_accessed = 0
-    self._block_fw_mem_time = 0
-    self._block_fw_time = 0
-    self._baseblock_fw_tp_size = 0
+    # All of these are per rank, for one microbatch, on a single
+    # transformer block; they are sums over all layers in the block.
+    # Forward compute & memory
+    self._block_fw_flops = 0                # Total forward FLOPs
+    self._block_fw_flops_time = 0           # Sum of compute‑only time for FW (FLOPs / matrix or vector throughput)
+    self._block_fw_mem_accessed = 0         # Sum of FW bytes accessed
+    self._block_fw_mem_time = 0             # Sum of memory‑only time for FW, i.e., mem_bytes / mem_bw
+    self._block_fw_time = 0                 # Sum of processing time for FW per block, compute+memory and overlapped time
+
+    # Forward TP comm (sizes & times)
+    self._baseblock_fw_tp_size = 0          # Total TP FW comm size (AG/RS/AR) for base/edge blocks. Non‑overlapped layers contribute 0
     self._edgeblock_fw_tp_size = 0
-    self._baseblock_fw_tp_time = 0
+    self._baseblock_fw_tp_time = 0          # Link time (+ potential on‑device reduction time) for FW TP comm
     self._edgeblock_fw_tp_time = 0
-    self._baseblock_fw_tp_time_exposed = 0
+    self._baseblock_fw_tp_time_exposed = 0  # Exposed (non‑hidden) part of FW TP comm under the layer’s tiling/overlap model
     self._edgeblock_fw_tp_time_exposed = 0
-    self._block_weight_space = 0
-    self._block_act_working_space = 0
-    self._block_act_storage_space = 0
+
+    # Memory footprints (capacity)
+    self._block_weight_space = 0            # Sum of all parameter bytes for this block
+    self._block_act_working_space = 0       # Sum of working activation bytes that are not flagged as “reused elsewhere”
+    self._block_act_storage_space = 0       # Sum of stored activations that persist for BW (before global recompute overrides)
+
+    # Recompute (re‑executed FW during BW when checkpointing)
     # We use this block for self.exe.training, but initialize anyway
-    self._block_re_flops = 0
-    self._block_re_flops_time = 0
-    self._block_re_mem_accessed = 0
-    self._block_re_mem_time = 0
-    self._block_re_time = 0
-    self._baseblock_recomm_size = 0
+    self._block_re_flops = 0                # Total recompute FLOPs. On each layer with needs_recompute=True, the code adds the cumulative FW FLOPs so far—modeling that FW prefix is re‑run during BW.
+    self._block_re_flops_time = 0           # Sum of compute‑only time for those recomputed FLOPs
+    self._block_re_mem_accessed = 0         # Sum of memory bytes re‑accessed during recompute
+    self._block_re_mem_time = 0             # Sum of memory‑only time for recompute
+    self._block_re_time = 0                 # Sum of processing time for the recomputed FW segments
+
+    # TP re-communication during weight-grad (e.g., redo AllGather)
+    # It is about sequence-parallel RS/AG and activation (re)compute
+    # colliding with what the weight-grad matmul actually needs.
+    self._baseblock_recomm_size = 0         # Total extra TP W‑grad comm size caused by “redo AG” (sequence parallel) or similar
     self._edgeblock_recomm_size = 0
-    self._baseblock_recomm_time = 0
+    self._baseblock_recomm_time = 0         # Link time for that re‑communication
     self._edgeblock_recomm_time = 0
-    self._baseblock_recomm_time_exposed = 0
+    self._baseblock_recomm_time_exposed = 0 # Exposed portion of the re‑communication time
     self._edgeblock_recomm_time_exposed = 0
-    self._block_agrad_flops = 0
-    self._block_agrad_flops_time = 0
-    self._block_agrad_mem_accessed = 0
-    self._block_agrad_mem_time = 0
-    self._block_agrad_time = 0
-    self._baseblock_agrad_tp_size = 0
+
+    # Backward – activation‑gradient (A‑grad) compute & memory
+    self._block_agrad_flops = 0             # Total BW A‑grad FLOPs
+    self._block_agrad_flops_time = 0        # Sum of compute‑only time for A‑grad
+    self._block_agrad_mem_accessed = 0      # Sum of A‑grad bytes accessed
+    self._block_agrad_mem_time = 0          # Sum of memory‑only time for A‑grad
+    self._block_agrad_time = 0              # Sum of processing time for A‑grad per block (compute + memory with any TP overlap)
+
+    # Backward TP communication (sizes & times) — A‑grad
+    self._baseblock_agrad_tp_size = 0         # Total TP BW (A‑grad) comm size (RS/AG/AR) for base/edge blocks
     self._edgeblock_agrad_tp_size = 0
-    self._baseblock_agrad_tp_time = 0
+    self._baseblock_agrad_tp_time = 0         # Link time (+ potential on‑device reductions) for BW TP comm
     self._edgeblock_agrad_tp_time = 0
-    self._baseblock_agrad_tp_time_exposed = 0
+    self._baseblock_agrad_tp_time_exposed = 0 # Exposed (not hidden) BW TP comm time
     self._edgeblock_agrad_tp_time_exposed = 0
-    self._block_wgrad_flops = 0
-    self._block_wgrad_flops_time = 0
-    self._block_wgrad_mem_accessed = 0
-    self._block_wgrad_mem_time = 0
-    self._block_wgrad_time = 0
-    self._block_optim_flops = 0
-    self._block_optim_flops_time = 0
-    self._block_optim_mem_accessed = 0
-    self._block_optim_mem_time = 0
-    self._block_optim_time = 0
-    self._block_weight_grad_space = 0
-    self._block_weight_grad_space_no_sharding = 0
-    self._block_act_grad_space = 0
-    self._block_optimizer_space = 0
-    self._tp_bw_overlap_req = 0
+
+    # Backward – weight‑gradient(W‑grad) compute & memory
+    self._block_wgrad_flops = 0             # Total BW weight‑grad FLOPs. Parameter‑free layers contribute 0
+    self._block_wgrad_flops_time = 0        # Sum of compute‑only time for W‑grad
+    self._block_wgrad_mem_accessed = 0      # Sum of W‑grad bytes accessed, or 0 for layers without parameters
+    self._block_wgrad_mem_time = 0          # Sum of memory‑only time for W‑grad
+    self._block_wgrad_time = 0              # Sum of processing time for W‑grad per block
+
+    # Optimizer (Adam) compute & memory
+    self._block_optim_flops = 0             # Total optimizer step FLOPs (Adam), modeled as 11 * weight_grads / DP_shard
+    self._block_optim_flops_time = 0        # Sum of compute‑only time for optimizer (vector throughput path).
+    self._block_optim_mem_accessed = 0      # Total bytes read/written by optimizer state (FP32 moments + optional FP32 master weights), sharded by DP if enabled
+    self._block_optim_mem_time = 0          # Sum of memory‑only time for optimizer
+    self._block_optim_time = 0              # Sum of processing time for optimizer per block
+
+    # Gradient/optimizer capacity footprints
+    self._block_weight_grad_space = 0       # Total weight‑grad storage, using low‑precision and DP sharding (what’s actually kept for communication/accumulation)
+    self._block_weight_grad_space_no_sharding = 0  # The same weight‑grad storage but as unsharded FP32
+    self._block_act_grad_space = 0          # Total activation‑gradient storage footprint across layers
+    self._block_optimizer_space = 0         # Total optimizer state capacity (FP32 moments + optional FP32 master weights), already divided by the DP shard count if sharding is enabled
+
+    # TP overlap bandwidth requirement
+    self._tp_bw_overlap_req = 0             # The maximum per‑tile link bandwidth required (across FW/BW and base/edge) to fully hide TP collectives under compute. Driven primarily by LinearOverlapped’s tiling model
 
     prev_layer_recompute = False
+
+    # The loop accumulates per‑microbatch, per‑block stats by summing each layer’s contribution
     for layer in self._llm_block:
-      # Add flops/bytes/times per layer
+      # Forward pass (FW): compute, memory, overlapped time
+      # Adds (a) pure FLOPs, (b) pure compute time (FLOPs / throughput), (c) pure memory
+      # bytes & time, and (d) processing time (compute + memory with any modeled overlap)
+      # for FW. For layers like LinearOverlapped, it also bakes in TP comm overlap and sets
+      # up “exposed net” bookkeeping
       self._block_fw_flops += layer.get_fw_flops()
       self._block_fw_flops_time += layer.compute_flops_time("fw")
       self._block_fw_mem_accessed += layer.get_fw_mem_accessed()
       self._block_fw_mem_time += layer.compute_mem_time("fw")
       self._block_fw_time += layer.compute_processing_time("fw")
-      self._baseblock_fw_tp_size += layer.get_comm_bytes("fw",
-        baseblock=True)
-      self._edgeblock_fw_tp_size += layer.get_comm_bytes("fw",
-        baseblock=False)
-      self._baseblock_fw_tp_time += layer.compute_net_time("fw",
-        baseblock=True)
-      self._edgeblock_fw_tp_time += layer.compute_net_time("fw",
-        baseblock=False)
-      self._baseblock_fw_tp_time_exposed += layer.get_exposed_net_time("fw",
-        baseblock=True)
-      self._edgeblock_fw_tp_time_exposed += layer.get_exposed_net_time("fw",
-        baseblock=False)
-      self._tp_bw_overlap_req = max(self._tp_bw_overlap_req,
-        layer.get_required_bandwidth("fw", baseblock=True))
-      self._tp_bw_overlap_req = max(self._tp_bw_overlap_req,
-        layer.get_required_bandwidth("fw", baseblock=False))
+
+      # FW TP comm: sizes, link time, exposed time, required bandwidth
+      self._baseblock_fw_tp_size += layer.get_comm_bytes("fw", baseblock=True)  # returns the collective payload (e.g., AG/RS/AR) in bytes; non‑TP layers return 0
+      self._edgeblock_fw_tp_size += layer.get_comm_bytes("fw", baseblock=False)
+      self._baseblock_fw_tp_time += layer.compute_net_time("fw", baseblock=True)  # asks the selected network model for the collective’s time
+      self._edgeblock_fw_tp_time += layer.compute_net_time("fw", baseblock=False)
+      self._baseblock_fw_tp_time_exposed += layer.get_exposed_net_time("fw", baseblock=True)  # the non‑hidden remainder after the layer’s overlap schedule is applied
+      self._edgeblock_fw_tp_time_exposed += layer.get_exposed_net_time("fw", baseblock=False)
+
+      self._tp_bw_overlap_req = max(self._tp_bw_overlap_req, layer.get_required_bandwidth("fw", baseblock=True))  # the per‑tile link bandwidth needed to fully hide the TP collective under compute; the loop keeps the max across all FW/BW stages and base/edge
+      self._tp_bw_overlap_req = max(self._tp_bw_overlap_req, layer.get_required_bandwidth("fw", baseblock=False))
+
+      # Training‑only: checkpoint recompute and “re‑communication”
       if self.exe.training:
+        # Checkpoint recompute (FW re‑execution during BW)
         if layer.get_recompute_flag():
+          # Model “re‑running FW from the last checkpoint up to here” during BW.
+          # This works when only boundary layers set needs_recompute=True (e.g.,
+          # a Fork that stores and later reuses)
           self._block_re_flops += self._block_fw_flops
           self._block_re_flops_time += self._block_fw_flops_time
           self._block_re_mem_accessed += self._block_fw_mem_accessed
           self._block_re_mem_time += self._block_fw_mem_time
           self._block_re_time += layer.compute_processing_time("fw")
+
+        # “Re‑communication” during W‑grad (e.g., redo AG for RS/AG)
         if layer.get_recomm_flag():
-          self._baseblock_recomm_size += layer.get_comm_bytes("wgrad",
-            baseblock=True)
-          self._edgeblock_recomm_size += layer.get_comm_bytes("wgrad",
-            baseblock=False)
-          self._baseblock_recomm_time += layer.compute_net_time("wgrad",
-            baseblock=True)
-          self._edgeblock_recomm_time += layer.compute_net_time("wgrad",
-            baseblock=False)
-          self._baseblock_recomm_time_exposed += layer.get_exposed_net_time(
-            "wgrad", baseblock=True)
-          self._edgeblock_recomm_time_exposed += layer.get_exposed_net_time(
-            "wgrad", baseblock=False)
+          # Some TP modes (sequence parallel, RS/AG) need to redo an AllGather
+          # during W‑grad. Layers that require it raise needs_recomm=True; this
+          # block captures the extra bytes/time (base & edge).
+          self._baseblock_recomm_size += layer.get_comm_bytes("wgrad", baseblock=True)
+          self._edgeblock_recomm_size += layer.get_comm_bytes("wgrad", baseblock=False)
+          self._baseblock_recomm_time += layer.compute_net_time("wgrad", baseblock=True)
+          self._edgeblock_recomm_time += layer.compute_net_time("wgrad", baseblock=False)
+          self._baseblock_recomm_time_exposed += layer.get_exposed_net_time("wgrad", baseblock=True)
+          self._edgeblock_recomm_time_exposed += layer.get_exposed_net_time("wgrad", baseblock=False)
+
+        # Backward – activation gradients (A‑grad) and its TP comm
+        # Mirrors FW accumulation but for A‑grad (backprop through activations).
         self._block_agrad_flops += layer.get_agrad_flops()
         self._block_agrad_flops_time += layer.compute_flops_time("agrad")
         self._block_agrad_mem_accessed += layer.get_agrad_mem_accessed()
         self._block_agrad_mem_time += layer.compute_mem_time("agrad")
         self._block_agrad_time += layer.compute_processing_time("agrad")
-        self._baseblock_agrad_tp_size += layer.get_comm_bytes("agrad",
-          baseblock=True)
-        self._edgeblock_agrad_tp_size += layer.get_comm_bytes("agrad",
-          baseblock=False)
-        self._baseblock_agrad_tp_time += layer.compute_net_time("agrad",
-          baseblock=True)
-        self._edgeblock_agrad_tp_time += layer.compute_net_time("agrad",
-          baseblock=False)
-        self._baseblock_agrad_tp_time_exposed += layer.get_exposed_net_time(
-          "agrad", baseblock=True)
-        self._edgeblock_agrad_tp_time_exposed += layer.get_exposed_net_time(
-          "agrad", baseblock=False)
-        self._tp_bw_overlap_req = max(self._tp_bw_overlap_req,
-          layer.get_required_bandwidth("agrad", baseblock=True))
-        self._tp_bw_overlap_req = max(self._tp_bw_overlap_req,
-          layer.get_required_bandwidth("agrad", baseblock=False))
+
+        self._baseblock_agrad_tp_size += layer.get_comm_bytes("agrad", baseblock=True)
+        self._edgeblock_agrad_tp_size += layer.get_comm_bytes("agrad", baseblock=False)
+        self._baseblock_agrad_tp_time += layer.compute_net_time("agrad", baseblock=True)
+        self._edgeblock_agrad_tp_time += layer.compute_net_time("agrad", baseblock=False)
+        self._baseblock_agrad_tp_time_exposed += layer.get_exposed_net_time("agrad", baseblock=True)
+        self._edgeblock_agrad_tp_time_exposed += layer.get_exposed_net_time("agrad", baseblock=False)
+
+        self._tp_bw_overlap_req = max(self._tp_bw_overlap_req, layer.get_required_bandwidth("agrad", baseblock=True))
+        self._tp_bw_overlap_req = max(self._tp_bw_overlap_req, layer.get_required_bandwidth("agrad", baseblock=False))
+
+        # Backward – weight gradients (W‑grad) and Optimizer
+        # W‑grad: Adds math/bytes/time for computing weight gradients (zero for parameter‑free layers).
         self._block_wgrad_flops += layer.get_wgrad_flops()
         self._block_wgrad_flops_time += layer.compute_flops_time("wgrad")
         self._block_wgrad_mem_accessed += layer.get_wgrad_mem_accessed()
         self._block_wgrad_mem_time += layer.compute_mem_time("wgrad")
         self._block_wgrad_time += layer.compute_processing_time("wgrad")
+
+        # Optimizer: Adds the Adam step’s FLOPs and the optimizer state bytes (vector throughput path)
         self._block_optim_flops += layer.get_optim_step_flops()
         self._block_optim_flops_time += layer.compute_flops_time("optim")
         self._block_optim_mem_accessed += layer.get_optim_step_mem_accessed()
         self._block_optim_mem_time += layer.compute_mem_time("optim")
         self._block_optim_time += layer.compute_processing_time("optim")
 
-      # Accumulate space requirements per block
-      self._block_weight_space += layer.get_weight()
+      # Footprint (memory capacity, bytes) per block
+      self._block_weight_space += layer.get_weight()              # parameters
       if not layer.reuses_activation():
-        self._block_act_working_space += layer.get_activation()
-      self._block_act_storage_space += layer.get_activation()
-      if self.exe.training:
-        if not layer.stores_output():
-          self._block_act_storage_space -= layer.get_output()
-        if not layer.stores_activation():
-          self._block_act_storage_space -= layer.get_activation()
-        self._block_weight_grad_space += layer.get_weight_grad()
-        self._block_weight_grad_space_no_sharding += layer.get_weight_grad(
-          sharded=False)
-        self._block_act_grad_space += layer.get_activation_grad()
-        self._block_optimizer_space += layer.get_optimizer()
+        self._block_act_working_space += layer.get_activation()   # working activations
+      self._block_act_storage_space += layer.get_activation()     # stored activations
 
+      if self.exe.training:
+        if not layer.stores_output():                             # do not store the output
+          self._block_act_storage_space -= layer.get_output()
+        if not layer.stores_activation():                         # do not store activations
+          self._block_act_storage_space -= layer.get_activation()
+        self._block_weight_grad_space += layer.get_weight_grad()  # weight gradients (sharded low-precision)
+        self._block_weight_grad_space_no_sharding += layer.get_weight_grad(sharded=False) # weight gradients (unsharded FP32)
+        self._block_act_grad_space += layer.get_activation_grad() # activation gradients
+        self._block_optimizer_space += layer.get_optimizer()      # optimizer state
+
+      # Debug logging for this layer (a layer in the current block)
       self.log.debug("%s %s %s", layer.name, 'Recompute flag:',
                      str(layer.get_recompute_flag()))
       self.log.debug("%s %s %s", layer.name, 'Recomm flag:',
@@ -1406,10 +1514,12 @@ class Llm:
       self.log.debug("%s %s %s", layer.name, 'Incremental Optim:',
                      human_format(self._block_optimizer_space, 'bytes'))
       prev_layer_recompute = layer.get_recompute_flag()
+
+    # outside layer loop here
     if self.exe.activation_recompute == 'full':
       self._block_act_storage_space = 0
 
-    # Sets the PP communication operation size
+    # Sets the PP communication size
     if self.exe.pipeline_par > 1:
       if self.exe._pipeline_par_rs_ag:
         self._block_fw_pp_size = self._seq_par_activation_size * \
@@ -1472,13 +1582,18 @@ class Llm:
     self._wgrad_mem_accessed = mult * self._block_wgrad_mem_accessed
     self._wgrad_mem_time = mult * self._block_wgrad_mem_time
     self._wgrad_time = mult * self._block_wgrad_time
+
+    # The optimizer stats are multiplied only by self._blocks_per_proc because
+    # the optimizer step is executed once per batch.
     self._optim_flops = self._blocks_per_proc * self._block_optim_flops
     self._optim_flops_time = self._blocks_per_proc * self._block_optim_flops_time
     self._optim_mem_accessed = self._blocks_per_proc * self._block_optim_mem_accessed
     self._optim_mem_time = self._blocks_per_proc * self._block_optim_mem_time
     self._optim_time = self._blocks_per_proc * self._block_optim_time
 
-    # These TP numbers are for total times for all blocks in all chunks
+    # Total TP communication time (link time and exposed time)
+    # It builds batch totals for TP collectives by summing base‑block and
+    # edge‑block contributions across all chunks and microbatches.
     tp_fw_comm_time = self.exe._num_microbatches * self._chunks_per_proc * (
       (self._baseblocks_per_chunk * self._baseblock_fw_tp_time) +
       (self._edgeblocks_per_chunk * self._edgeblock_fw_tp_time))
@@ -1501,58 +1616,87 @@ class Llm:
         (self._baseblocks_per_chunk * self._baseblock_recomm_time_exposed) +
         (self._edgeblocks_per_chunk * self._edgeblock_recomm_time_exposed))
 
-    # Per chunk PP comm time
-    chunk_fw_pp_time = self._pp_net.time('p2p', self._block_fw_pp_size, 2)
-    chunk_bw_pp_time = self._pp_net.time('p2p', self._block_bw_pp_size, 2)
+    P_eff = self.exe.pipeline_par * self.exe.pipeline_interleaving
+    owners = [i % self.exe.pipeline_par for i in range(P_eff)]
 
-    # Determines number of times PP causes pipeline p2p communications per
-    # chunk during the forward and backward pass (equal to chunks per proc)
-    if self.exe.pipeline_par > 1:
-      num_fw_pp_p2ps = self._chunks_per_proc
-      if self.exe.training:
-        num_bw_pp_p2ps = self._chunks_per_proc
-      else:
-        num_bw_pp_p2ps = 0
+    # Per-boundary P2P times (FW/BW)
+    t_fw = []  # len = max(P_eff-1, 0)
+    t_bw = []
+    if P_eff > 1:
+      for i in range(P_eff - 1):
+        src = owners[i]
+        dst = owners[i + 1]
+        if src == dst:
+          # Adjacent virtual stages on same rank ⇒ no P2P for this boundary
+          t_fw.append(0.0)
+          t_bw.append(0.0)
+          continue
+        net = None
+        for net_ in self.sys.networks:
+          if src // net_.size == dst // net_.size:
+            net = net_
+            break
+        assert net is not None
+        t_fw.append(net.time('p2p', self._block_fw_pp_size, 2))
+        t_bw.append(net.time('p2p', self._block_bw_pp_size, 2))
+
+    # Aggregate to per-stage PP times (enter + leave)
+    # For stage s:
+    #   FW: enter = t_fw[s-1] (if s>0), leave = t_fw[s] (if s<P_eff-1)
+    #   BW: enter = t_bw[s],   leave = t_bw[s-1] (if s>0)
+    pp_fw_stage = [0.0] * P_eff
+    pp_bw_stage = [0.0] * P_eff
+    if P_eff > 0:
+      for s in range(P_eff):
+        fw_in = t_fw[s - 1] if (s > 0) and t_fw else 0.0
+        fw_out = t_fw[s] if (s < P_eff - 1) and t_fw else 0.0
+        bw_in = t_bw[s] if (s < P_eff - 1) and t_bw else 0.0
+        bw_out = t_bw[s - 1] if (s > 0) and t_bw else 0.0
+        pp_fw_stage[s] = fw_in + fw_out
+        pp_bw_stage[s] = bw_in + bw_out
+
+    # Choose this-rank's stage-period PP cost for block-level injection
+    # consider interleaving by taking, for each owner (real rank), the max
+    # across its virtual stages; since we don't know our rank here, use
+    # the conservative max across owners.
+    pp_fw_per_owner = [0.0] * self.exe.pipeline_par
+    pp_bw_per_owner = [0.0] * self.exe.pipeline_par
+    for s in range(P_eff):
+      o = owners[s]
+      if pp_fw_stage[s] > pp_fw_per_owner[o]:
+        pp_fw_per_owner[o] = pp_fw_stage[s]
+      if pp_bw_stage[s] > pp_bw_per_owner[o]:
+        pp_bw_per_owner[o] = pp_bw_stage[s]
+
+    # Batch-level KPI totals
+    chunk_fw_pp_time = max(pp_fw_per_owner) if pp_fw_per_owner else 0.0
+    pp_fw_comm_time = self.exe._num_microbatches * sum(t_fw)
+    if self.exe.training:
+      chunk_bw_pp_time = max(pp_bw_per_owner) if pp_bw_per_owner else 0.0
+      pp_bw_comm_time = self.exe._num_microbatches * sum(t_bw)
     else:
-      num_fw_pp_p2ps = 0
-      num_bw_pp_p2ps = 0
+      chunk_bw_pp_time = 0.0
+      pp_bw_comm_time = 0.0
 
-    # These PP numbers are for total times for all blocks and all microbatches
-    pp_fw_comm_time = self.exe._num_microbatches * num_fw_pp_p2ps * \
-      chunk_fw_pp_time
-    pp_bw_comm_time = self.exe._num_microbatches * num_bw_pp_p2ps * \
-      chunk_bw_pp_time
-
-    # Aggregrates metrics
     self._tp_comm_time_link = tp_fw_comm_time + tp_bw_comm_time
-    self._tp_comm_time_exposed = (tp_fw_comm_time_exposed +
-      tp_bw_comm_time_exposed)
+    self._tp_comm_time_exposed = tp_fw_comm_time_exposed + tp_bw_comm_time_exposed
     self._recomm_time_link = tp_recomm_time
     self._recomm_time_exposed = tp_recomm_time_exposed
     self._pp_comm_time_link = pp_fw_comm_time + pp_bw_comm_time
-    self._pp_comm_time_exposed = self._pp_comm_time_link
+    self._pp_comm_time_exposed = self._pp_comm_time_link  # no-overlap ⇒ exposed == link
 
-    self.log.debug("%s %s", 'TP comm baseblock FW time:',
-      self._baseblock_fw_tp_time)
-    self.log.debug("%s %s", 'TP comm edgeblock FW time:',
-      self._edgeblock_fw_tp_time)
+    self.log.debug("%s %s", 'TP comm baseblock FW time:', self._baseblock_fw_tp_time)
+    self.log.debug("%s %s", 'TP comm edgeblock FW time:', self._edgeblock_fw_tp_time)
     self.log.debug("%s %s", 'TP comm FW time:', tp_fw_comm_time)
-    self.log.debug("%s %s", 'TP comm baseblock FW exposed time:',
-      self._baseblock_fw_tp_time_exposed)
-    self.log.debug("%s %s", 'TP comm edgeblock FW exposed time:',
-      self._edgeblock_fw_tp_time_exposed)
+    self.log.debug("%s %s", 'TP comm baseblock FW exposed time:', self._baseblock_fw_tp_time_exposed)
+    self.log.debug("%s %s", 'TP comm edgeblock FW exposed time:', self._edgeblock_fw_tp_time_exposed)
     self.log.debug("%s %s", 'TP comm FW exposed time:', tp_fw_comm_time_exposed)
-    self.log.debug("%s %s", 'TP comm baseblock BW time:',
-      self._baseblock_agrad_tp_time)
-    self.log.debug("%s %s", 'TP comm edgeblock BW time:',
-      self._edgeblock_agrad_tp_time)
+    self.log.debug("%s %s", 'TP comm baseblock BW time:', self._baseblock_agrad_tp_time)
+    self.log.debug("%s %s", 'TP comm edgeblock BW time:', self._edgeblock_agrad_tp_time)
     self.log.debug("%s %s", 'TP comm BW time:', tp_bw_comm_time)
-    self.log.debug("%s %s", 'TP comm baseblock BW exposed time:',
-      self._baseblock_agrad_tp_time_exposed)
-    self.log.debug("%s %s", 'TP comm edgeblock BW exposed time:',
-      self._edgeblock_agrad_tp_time_exposed)
-    self.log.debug("%s %s", 'TP comm BW exposed time:',
-      tp_bw_comm_time_exposed)
+    self.log.debug("%s %s", 'TP comm baseblock BW exposed time:', self._baseblock_agrad_tp_time_exposed)
+    self.log.debug("%s %s", 'TP comm edgeblock BW exposed time:', self._edgeblock_agrad_tp_time_exposed)
+    self.log.debug("%s %s", 'TP comm BW exposed time:', tp_bw_comm_time_exposed)
     self.log.debug("%s %s", 'PP comm chunk FW time:', chunk_fw_pp_time)
     self.log.debug("%s %s", 'PP comm chunk BW time:', chunk_bw_pp_time)
     self.log.debug("%s %s", 'PP comm FW time:', pp_fw_comm_time)
@@ -1560,24 +1704,22 @@ class Llm:
 
     # Bubble forms between i-th microbatch FW and BW passes on the 1st GPU.
     # With no interleaving between blocks, it includes
-    # L/gpu x microbatch_time x (p-1) x Tcycle, where cycle includes both
+    # L/gpu * microbatch_time * (p-1) * Tcycle, where cycle includes both
     # FW and BW passes, TP and PP communication for FW and BW passes
-    # With full interleaving, we only need microbatch_time x (p-1) x Tcycle time
-    self._baseblock_fw_time_no_offload = (
-      self._block_fw_time + self._baseblock_fw_tp_time_exposed)
-    self._edgeblock_fw_time_no_offload = (
-      self._block_fw_time + self._edgeblock_fw_tp_time_exposed +
-      chunk_fw_pp_time)
+    # With full interleaving, we only need microbatch_time * (p-1) * Tcycle time
+    self._baseblock_fw_time_no_offload = self._block_fw_time + self._baseblock_fw_tp_time_exposed
+    self._edgeblock_fw_time_no_offload = self._block_fw_time + self._edgeblock_fw_tp_time_exposed + chunk_fw_pp_time
     self._baseblock_fw_offload_overhead = max(
-      0, self.get_fw_offload_time() + self._block_fw_mem_time -
-      self._baseblock_fw_time_no_offload)
+      0,
+      self.get_fw_offload_time() + self._block_fw_mem_time - self._baseblock_fw_time_no_offload
+    )
     self._edgeblock_fw_offload_overhead = max(
-      0, self.get_fw_offload_time() + self._block_fw_mem_time -
-      self._edgeblock_fw_time_no_offload)
-    self._baseblock_fw_time = (
-      self._baseblock_fw_time_no_offload + self._baseblock_fw_offload_overhead)
-    self._edgeblock_fw_time = (
-      self._edgeblock_fw_time_no_offload + self._edgeblock_fw_offload_overhead)
+      0,
+      self.get_fw_offload_time() + self._block_fw_mem_time - self._edgeblock_fw_time_no_offload
+    )
+    self._baseblock_fw_time = self._baseblock_fw_time_no_offload + self._baseblock_fw_offload_overhead
+    self._edgeblock_fw_time = self._edgeblock_fw_time_no_offload + self._edgeblock_fw_offload_overhead
+
     # When we consider block BW time, we do not add optimizer step to it
     # because we have optimizer only for last microbatches, while offloading
     # works during the whole backward pass.
@@ -1609,6 +1751,7 @@ class Llm:
     chunk_bw_time = (
       (self._baseblocks_per_chunk * self._baseblock_bw_time) +
       (self._edgeblocks_per_chunk * self._edgeblock_bw_time))
+
     # Can't overlap DP comm with mem accesses, but can overlap with offload
     baseblock_dp_overlap_time = self._baseblock_bw_time - (
       self._block_agrad_mem_time + self._block_wgrad_mem_time +
@@ -1619,6 +1762,7 @@ class Llm:
     block_dp_compute_time = (
       self._block_agrad_flops_time + self._block_wgrad_flops_time +
       self._block_re_flops_time)
+
     if not self.exe.optimizer_sharding:
       # If optimizer is not sharded, we can overlap optimizer step with
       # communication, except for memory access time
@@ -1627,17 +1771,20 @@ class Llm:
       edgeblock_dp_overlap_time += (
         self._block_optim_time - self._block_optim_mem_time)
       block_dp_compute_time += self._block_optim_flops_time
+
     if self._dp_net == self._tp_net:
       # Can't overlap DP with TP if in the same network
       baseblock_dp_overlap_time -= (
         self._baseblock_recomm_time + self._baseblock_agrad_tp_time)
       edgeblock_dp_overlap_time -= (
         self._edgeblock_recomm_time + self._edgeblock_agrad_tp_time)
+
     chunk_dp_overlap_time = (
       self._baseblocks_per_chunk * baseblock_dp_overlap_time +
       self._edgeblocks_per_chunk * edgeblock_dp_overlap_time)
     chunk_dp_compute_time = self._blocks_per_chunk * block_dp_compute_time
     chunk_time = chunk_fw_time + chunk_bw_time
+
     # Block bubbles appear due to uneven division of blocks by pipeline stages
     # and result in the schedule bubble shorten by the missing edge blocks on
     # the later pipeline stages (missing block case)
@@ -1650,6 +1797,7 @@ class Llm:
       # If chunk doesn't have base blocks, we cut edge block
       bubble_reduction_time = self._bubble_reduction_blocks * (
         self._edgeblock_fw_time + self._edgeblock_bw_time)
+
     # With PP interleaving we assume that we move through every chunk at least
     # PP mini batches. If num_microbatches < PP, then we have extra bubbles
     # (missing microbatches case). We have the bubbles in the last microbatches
@@ -1661,8 +1809,7 @@ class Llm:
     microbatch_shortage = self.exe.pipeline_par - (
       self.exe._num_microbatches % self.exe.pipeline_par)
     if self.exe._num_microbatches % self.exe.pipeline_par != 0:
-      extra_interleaving_bubbles = num_overlappable_chunks * \
-        microbatch_shortage
+      extra_interleaving_bubbles = num_overlappable_chunks * microbatch_shortage
     else:
       extra_interleaving_bubbles = 0
     self._bubble_time = chunks_in_bubble * chunk_time + (
@@ -1670,25 +1817,19 @@ class Llm:
 
     self.log.debug("%s %s", 'Block FW time:', self._block_fw_time)
     self.log.debug("%s %s", 'Baseblock FW time:', self._baseblock_fw_time)
-    self.log.debug("%s %s", 'With FW offload overhead time:',
-      self._baseblock_fw_offload_overhead)
+    self.log.debug("%s %s", 'With FW offload overhead time:', self._baseblock_fw_offload_overhead)
     self.log.debug("%s %s", 'Edgeblock FW time:', self._edgeblock_fw_time)
-    self.log.debug("%s %s", 'With FW offload overhead time:',
-      self._edgeblock_fw_offload_overhead)
-    self.log.debug("%s %s", 'Baseblock REcomm exposed time:',
-      self._baseblock_recomm_time_exposed)
-    self.log.debug("%s %s", 'Edgeblock REcomm exposed time:',
-      self._edgeblock_recomm_time_exposed)
+    self.log.debug("%s %s", 'With FW offload overhead time:', self._edgeblock_fw_offload_overhead)
+    self.log.debug("%s %s", 'Baseblock REcomm exposed time:', self._baseblock_recomm_time_exposed)
+    self.log.debug("%s %s", 'Edgeblock REcomm exposed time:', self._edgeblock_recomm_time_exposed)
     self.log.debug("%s %s", 'Block RE time:', self._block_re_time)
     self.log.debug("%s %s", 'Block BW Agrad time:', self._block_agrad_time)
     self.log.debug("%s %s", 'Block BW Wgrad time:', self._block_wgrad_time)
     self.log.debug("%s %s", 'Block optim time:', self._block_optim_time)
     self.log.debug("%s %s", 'Baseblock BW time:', self._baseblock_bw_time)
-    self.log.debug("%s %s", 'With BW offload overhead time:',
-      self._baseblock_bw_offload_overhead)
+    self.log.debug("%s %s", 'With BW offload overhead time:', self._baseblock_bw_offload_overhead)
     self.log.debug("%s %s", 'Edgeblock BW time:', self._edgeblock_bw_time)
-    self.log.debug("%s %s", 'With BW offload overhead time:',
-      self._edgeblock_bw_offload_overhead)
+    self.log.debug("%s %s", 'With BW offload overhead time:', self._edgeblock_bw_offload_overhead)
 
     # Determines how long it takes to perform the DP per block
     # This assumes no DP communication overlap (will be adjusted later).
@@ -1710,10 +1851,9 @@ class Llm:
     else:
       self._block_dp_size = 0
       self._block_dp_time = 0
-    self.log.debug('DP block comm size: %s',
-                   human_format(self._block_dp_size, 'bytes'))
-    self.log.debug('DP block comm time (no overlap): %.3e',
-                   self._block_dp_time)
+
+    self.log.debug('DP block comm size: %s', human_format(self._block_dp_size, 'bytes'))
+    self.log.debug('DP block comm time (no overlap): %.3e', self._block_dp_time)
 
     # DP overlap happens if DP time for a previous block(s) is lower than
     # microbatch BW pass time for next pack of consecutive blocks
@@ -1848,12 +1988,12 @@ class Llm:
       self._dp_comm_time_link = 0
       self._dp_bw_overlap_req_chunk = 0
       self._dp_bw_overlap_req_tail = 0
+
     self.log.debug('Chunk FW time: %.3e', chunk_fw_time)
     self.log.debug('Chunk BW time: %.3e', chunk_bw_time)
     self.log.debug('Chunk BW time for DP overlap: %.3e', chunk_dp_overlap_time)
     self.log.debug('DP comm time exposed: %.3e', self._dp_comm_time_exposed)
-    self.log.debug('DP comm time on the link: %.3e',
-                   self._dp_comm_time_link)
+    self.log.debug('DP comm time on the link: %.3e', self._dp_comm_time_link)
     self.log.debug('DP comm required bandwidth for overlapped chunks: %s',
                    human_format(self._dp_bw_overlap_req_chunk, "bandwidth"))
     self.log.debug('DP comm required bandwidth for the last chunk: %s',
@@ -1910,7 +2050,7 @@ class Llm:
       self._act_checkpoint_size = 0
       self._act_grad_space = 0
 
-    # Optimizer split  already accounted for during block compilation
+    # Optimizer split already accounted for during block compilation
     # We should keep non-sharded weight grad for a current block for AllReduce
     # and one that we currently compute, so 2x total
     # We only need a single no sharded weight grad copy for before reduction
@@ -2224,8 +2364,6 @@ class Llm:
     else:
       return 0
 
-    return self._block_optimizer_space * 2
-
   def get_optimizer_space_min(self):
     if self.exe.training:
       return self._block_optimizer_space * 2
@@ -2345,7 +2483,6 @@ class Llm:
       f"DP={self.exe.data_par}\n" \
       f"Blocks per processor: {self._blocks_per_proc}\n" \
       f"Execution: {self.exe.get_json()};\n" \
-      f"System: {self.sys.cfg};\n" \
       f"Weights: {human_format(self.get_weight_space(), 'bytes')};\n" \
       f"Act: {human_format(self.get_act_space(), 'bytes')};\n" \
       f"Act CP: {human_format(self.get_act_checkpoint_size(), 'bytes')};\n" \

@@ -19,7 +19,7 @@
 class Network:
   """Configuration for a network."""
 
-  kKeys = set(['bandwidth', 'efficiency', 'size', 'latency', 'ops',
+  kKeys = set(['bandwidth', 'pp_efficiency', 'ar_efficiency','size', 'latency', 'ops',
                'must_be_filled', 'processor_usage'])
   kNetOps = set(['p2p', 'reduce_scatter', 'all_gather', 'all_reduce'])
   kCollectives = set(['reduce_scatter', 'all_gather', 'all_reduce'])
@@ -44,8 +44,12 @@ class Network:
     assert Network.kKeys == set(cfg.keys())
     self._bw = cfg['bandwidth'] * 1e9  # Specified in GB/s
     assert self._bw > 0
-    self._eff = cfg['efficiency']
-    assert 0 < self._eff <= 1.0
+
+    def _parse_net_efficiency(effs):
+      return [[thr * 2**20, eff] for thr, eff in effs]
+
+    self._pp_eff = _parse_net_efficiency(cfg['pp_efficiency'])
+    self._ar_eff = _parse_net_efficiency(cfg['ar_efficiency'])
     self._size = cfg['size']
     assert self._size >= 0
     self._latency = cfg['latency']
@@ -70,6 +74,12 @@ class Network:
   def processor_usage(self):
     return self._proc_usage
 
+  def get_efficiency(self, op, op_size):
+    effs = self._pp_eff if op == "p2p" else self._ar_eff
+    for thr, eff in effs:
+      if op_size >= thr:
+        return eff
+
   def time(self, op, op_size, comm_size):
     """ Computes the time taken for a network operation.
 
@@ -87,13 +97,24 @@ class Network:
       assert comm_size >= 2
     assert op in Network.kNetOps
     assert op_size >= 0
-
-    # Scales the op_size by the scalar
+    op_eff = self.get_efficiency(op, op_size)
+    # Bandwidth term:
+    #   For P2P,   scalar=1, offset=0,  then op_size =             bytes;
+    #   For AR,    scalar=2, offset=-1, then op_size = 2*(p-1)/p * bytes;
+    #   For RS/AG, scalar=1, offset=-1, then op_size =   (p-1)/p * bytes.
     op_size *= self._ops[op].scalar
-
-    # Scales the op_size by the op offset
     chunk_size = 1 / comm_size * op_size
     op_size += chunk_size * self._ops[op].offset
-
-    # Calculates time based on raw bandwidth,  bandwidth efficiency, and latency
-    return self._latency + op_size / (self._bw * self._eff)
+    # Latency term:
+    #   For P2P,      1  hop;
+    #   For AR,  2*(p-1) stages;
+    #   For RS/AG, (p-1) stages.
+    if op == "p2p":
+      latency = self._latency
+    elif op == "all_reduce":
+      latency = (comm_size - 1) * 2 * self._latency
+    elif op in ("reduce_scatter", "all_gather"):
+      latency = (comm_size - 1) * self._latency
+    else:
+      raise NotImplementedError("Unknown communication type: {}".format(op))
+    return latency + op_size / (self._bw * op_eff)

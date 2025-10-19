@@ -21,7 +21,7 @@ import argparse
 import calculon
 import logging
 import sys
-
+import time
 
 
 
@@ -55,4 +55,9 @@ if __name__ == '__main__':
   logger.setLevel(args.verbosity)
 
   # Calls the corresponding command function
-  sys.exit(args.func(logger, args))
+  start_time = time.time()
+  ret = args.func(logger, args)
+  end_time = time.time()
+  print("Calculon run time (in seconds):", end_time - start_time)
+
+  sys.exit(ret)
