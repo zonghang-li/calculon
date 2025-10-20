@@ -38,6 +38,14 @@ class Llm:
       self.kv_groups = cfg.get('kv_groups', self.attn_heads)
       self.attn_size = cfg['attn_size']
       self.num_blocks = cfg['num_blocks']
+      self.vocab_size = cfg.get('vocab_size', 51200)
+      # tie token embedding weights with LM head
+      self.tie_embeddings = cfg.get('tie_embeddings', True)
+      # When PP > 1, statistics reported are per-rank. To make the effect of
+      # embedding visible, we assume this process is the first PP stage by
+      # default. You can override this via "pp_stage_role" with values:
+      #   "first | middle | last"
+      self.pp_stage_role = cfg.get('pp_stage_role', 'first')
 
     def num_parameters(self):
       # https://cs.stanford.edu/~matei/papers/2021/sc_megatron_lm.pdf
@@ -48,7 +56,10 @@ class Llm:
       p += (2 * self.kv_groups + self.attn_heads) * self.attn_size + self.hidden      # biases Attn
       p += 2 * 2 * self.hidden                                                        # layer norm
       p *= self.num_blocks                                                            # per each block
-      p += (51200 + self.seq_size) * self.hidden                                      # embeddings
+      if self.tie_embeddings:
+        p += (self.vocab_size + self.seq_size) * self.hidden                          # token+position embeddings
+      else:
+        p += (2 * self.vocab_size + self.seq_size) * self.hidden                      # token+position embeddings and LM head
       return p
 
   class Execution:
@@ -63,11 +74,12 @@ class Llm:
         'activation_recompute', 'pipeline_interleaving', 'optimizer_sharding',
         'tensor_par_comm_type', 'tensor_par_overlap', 'seq_par_ag_redo',
         'data_par_overlap', 'weight_offload', 'activations_offload',
-        'optimizer_offload', 'training')
+        'optimizer_offload', 'grad_reduce_in_fp32', 'training')
 
     @staticmethod
     def from_json(cfg):
       cfg.setdefault('qkv_packing', True)
+      cfg.setdefault('grad_reduce_in_fp32', False)
       assert set(cfg.keys()) == set(Llm.Execution.fields())
       values = [cfg[field] for field in Llm.Execution.fields()]
       return Llm.Execution(*values)
@@ -79,7 +91,8 @@ class Llm:
                  pipeline_interleaving, optimizer_sharding,
                  tensor_par_comm_type, tensor_par_overlap,
                  seq_par_ag_redo, data_par_overlap, weight_offload,
-                 activations_offload, optimizer_offload, training):
+                 activations_offload, optimizer_offload,
+                 grad_reduce_in_fp32, training):
       self.training = training
       self.num_procs = num_procs
       assert self.num_procs > 0
@@ -143,6 +156,7 @@ class Llm:
       self.weight_offload = weight_offload
       self.activations_offload = activations_offload
       self.optimizer_offload = optimizer_offload
+      self.grad_reduce_in_fp32 = bool(grad_reduce_in_fp32)
       if self.optimizer_offload:
         assert self.training, \
           "We only perform optimizer offloading during training"
@@ -156,7 +170,7 @@ class Llm:
         self.activation_recompute, self.pipeline_interleaving, self.optimizer_sharding,
         self.tensor_par_comm_type, self.tensor_par_overlap, self.seq_par_ag_redo,
         self.data_par_overlap, self.weight_offload, self.activations_offload,
-        self.optimizer_offload, self.training
+        self.optimizer_offload, self.grad_reduce_in_fp32, self.training
       ]
       assert len(keys) == len(values)
       return dict(zip(keys, values))
@@ -235,22 +249,39 @@ class Llm:
 
   @staticmethod
   def get_valid_pipeline_interleavings(num_blocks, pipeline_par):
-    assert num_blocks % pipeline_par == 0
+    """
+    Valid interleaving factors are divisors of the number of blocks handled
+    per processor (ceil(num_blocks / pipeline_par)). For PP==1 we force 1,
+    matching Execution.__init__ and compile().
+    """
     if pipeline_par == 1:
       yield 1
-    else:
-      max_ppint = num_blocks // pipeline_par
-      yield from Llm._factors(max_ppint)
+      return
+    blocks_per_proc = (num_blocks + pipeline_par - 1) // pipeline_par
+    for cand in Llm._factors(blocks_per_proc):
+      yield cand
 
   @staticmethod
   def get_valid_microbatch_sizes(
-      seq_size, tensor_par, data_par, global_batch_size, pipeline_par):
+      seq_size,
+      tensor_par,
+      data_par,
+      global_batch_size,
+      pipeline_par,
+      tensor_par_comm_type=None
+  ):
+    """
+    Yield microbatch sizes that divide the local batch. If using sequence-parallel
+    (tensor_par_comm_type == 'rs_ag'), additionally require that
+    (microbatch * seq_size) % tensor_par == 0 so that sequence shards are even.
+    """
     assert global_batch_size % data_par == 0
     local_batch_size = global_batch_size // data_par
+    require_seq_div = (tensor_par > 1) and (tensor_par_comm_type == 'rs_ag')
     for cand in Llm._factors(local_batch_size):
-      batch_seq = cand * seq_size
-      if batch_seq % tensor_par == 0:
-        yield cand
+      if require_seq_div and ((cand * seq_size) % tensor_par != 0):
+        continue
+      yield cand
 
   @staticmethod
   def can_redo_ag(tensor_par_comm_type, activation_recompute):
@@ -417,6 +448,18 @@ class Llm:
     self._dp_comm_time_link = None
     self._bubble_time = None
 
+    # Embedding and LM head stats
+    self._embed_weight_elems_shard = 0
+    self._lm_head_weight_elems_shard = 0
+    self._pp_embed_grad_time_per_batch = 0.0  # PP AR for tied embeddings' grads, time per batch, not per micro-batch
+    self._tp_embed_fw_time_per_micro = 0.0    # vocab-parallel embedding FW AR
+    self._tp_embed_bw_time_per_micro = 0.0    # vocab-parallel embedding BW AR
+    self._tp_lm_head_fw_time_per_micro = 0.0  # LM head input AG (or AR)
+    self._tp_lm_head_bw_time_per_micro = 0.0  # LM head grad RS (or AR)
+    self._padded_vocab = 0                    # Padded vocab (aligned to TP) for LM-head
+    self._lm_head_fw_comp_time_per_micro = 0.0
+    self._lm_head_bw_comp_time_per_micro = 0.0
+
   @staticmethod
   def get_stats_fields():
     return (
@@ -460,8 +503,8 @@ class Llm:
 
       'baseblock_fw_tp_size',
       'edgeblock_fw_tp_size',
-      'baseblock_bw_tp_size',
-      'edgeblock_bw_tp_size',
+      'baseblock_agrad_tp_size',
+      'edgeblock_agrad_tp_size',
       'baseblock_recomm_size',
       'edgeblock_recomm_size',
       'block_fw_pp_size',
@@ -710,7 +753,7 @@ class Llm:
           ))
         # View op is zero-FLOP, it shouldn't add cost, so we just ignore it.
         else:
-          raise self.Error('Wrong attention type', self.exe.attention_type)
+          raise self.Error(f"Wrong attention type: {self.exe.attention_type}")
       else:
         self._llm_block.append(Fork(
           "AttnBlock_Multihead_Fork",
@@ -760,7 +803,7 @@ class Llm:
             activation_stored=False,
             activation_reused=True))
         elif self.exe.attention_type == 'multiquery':
-          # Multiqueri attention uses the same K, V for all "heads" resulting in
+          # Multiquery attention uses the same K, V for all "heads" resulting in
           # smaller Wk and Wv, less matmul, faster inference
           self._llm_block.append(Linear(
             "AttnBlock_Key",
@@ -785,7 +828,7 @@ class Llm:
             activation_stored=False,
             activation_reused=True))
         else:
-          raise self.Error('Wrong attention type', self.exe.attention_type)
+          raise self.Error(f"Wrong attention type: {self.exe.attention_type}")
     else:
       # LinearOverlapped already models QKV packing
       if self.exe.attention_type in ['multihead', 'groupquery']:
@@ -857,7 +900,7 @@ class Llm:
           activation_stored=False,
           activation_reused=True))
       else:
-        raise self.Error('Wrong attention type', self.exe.attention_type)
+        raise self.Error(f"Wrong attention type: {self.exe.attention_type}")
     self._llm_block.append(BatchMatMulGQA(
       "AttnBlock_Multihead_Key_Query",
       self.sys,
@@ -1094,7 +1137,7 @@ class Llm:
     self.sys.set_datatype(self.exe.datatype)
 
     # If we have number of blocks not divisible by PP, we can allocate the
-    # reminder of the blocks on the first num_block % PP Procs and block
+    # remainder of the blocks on the first num_block % PP Procs and block
     # "bubbles" on the last PP - (num_block % PP) Procs. To reflect that,
     # we round up blocks_per_proc. We report time for Proc0. In that case
     # its bubble time is `PP - (num_block % PP)` blocks shorter
@@ -1127,7 +1170,7 @@ class Llm:
     self._blocks_per_chunk = \
       self._blocks_per_proc // self.exe.pipeline_interleaving
     assert self._blocks_per_proc % self._blocks_per_chunk == 0, \
-      "PP interleaving should evenly devide {self._blocks_per_proc} blocks"
+      f"PP interleaving should evenly divide {self._blocks_per_proc} blocks"
     self._chunks_per_proc = self._blocks_per_proc // self._blocks_per_chunk
     assert self._chunks_per_proc == self.exe.pipeline_interleaving, \
       "Number of chunks should be equal to pipeline_interleaving"
@@ -1149,6 +1192,25 @@ class Llm:
       layer.set_bytes_per_element(self._bytes_per_element)
       if self.exe.optimizer_sharding:
         layer.shard_optimizer(self.exe.data_par)
+    # Embedding / LM head derived sizes & PP embedding-grad AR time
+    # Vocab-parallel token embedding:
+    #   - The embedding matrix is sharded along the vocab dimension across TP.
+    #   - The forward produces partial outputs that are summed via TP AR
+    #     (we model the additional TP AR explicitly below), and the backward
+    #     produces weight-grads that, when embeddings are tied with the output
+    #     head, must be all-reduced across the PP group.
+    #   - This "backward-embedding-all-reduce" is a PP AR.
+    # We model PP AR here. We compute the per-rank shard size and its AR time on
+    # the selected PP network and later add it once per batch iteration.
+    if self.app.vocab_size % self.exe.tensor_par != 0:
+      # Pad vocab so that vocab % TP == 0
+      self._padded_vocab = ((self.app.vocab_size + self.exe.tensor_par - 1) //
+                       self.exe.tensor_par) * self.exe.tensor_par
+    else:
+      self._padded_vocab = self.app.vocab_size
+    self._embed_weight_elems_shard = (self._padded_vocab // self.exe.tensor_par) * self.app.hidden
+    # If embeddings are untied, LM head is a separate matrix with the same shape
+    self._lm_head_weight_elems_shard = 0 if self.app.tie_embeddings else self._embed_weight_elems_shard
     self._compiled = True
 
   def _check_network_assignments(self):
@@ -1289,8 +1351,6 @@ class Llm:
 
     # TP overlap bandwidth requirement
     self._tp_bw_overlap_req = 0             # The maximum per‑tile link bandwidth required (across FW/BW and base/edge) to fully hide TP collectives under compute. Driven primarily by LinearOverlapped’s tiling model
-
-    prev_layer_recompute = False
 
     # The loop accumulates per‑microbatch, per‑block stats by summing each layer’s contribution
     for layer in self._llm_block:
@@ -1486,7 +1546,7 @@ class Llm:
                      human_format(layer.get_optim_step_mem_accessed(), 'bytes'))
       self.log.debug("%s %s %.3e", layer.name, 'Optim time:',
                      layer.compute_processing_time("optim"))
-      self.log.debug("%s %s %.3e", layer.name, 'Recompute:',
+      self.log.debug("%s %s %s", layer.name, 'Recompute:',
                      layer.get_recompute_flag())
       self.log.debug("%s %s %s", layer.name, 'Recompute mem saving:',
                      human_format(layer.stores_output() * \
@@ -1513,7 +1573,6 @@ class Llm:
                      human_format(self._block_act_grad_space, 'bytes'))
       self.log.debug("%s %s %s", layer.name, 'Incremental Optim:',
                      human_format(self._block_optimizer_space, 'bytes'))
-      prev_layer_recompute = layer.get_recompute_flag()
 
     # outside layer loop here
     if self.exe.activation_recompute == 'full':
@@ -1560,6 +1619,53 @@ class Llm:
     This function computes the statistics for a full batch. This uses the per
     microbatch per block statistics from the prior function (see above).
     """
+
+    # Helper: bytes for gradient reductions (DP / PP embedding-grad)
+    def _grad_comm_bytes(num_elems: int) -> int:
+      if self.exe.grad_reduce_in_fp32:
+        return num_elems * System.TypeSizes['float32']
+      else:
+        return num_elems * self._bytes_per_element
+
+    # PP AR for tied embeddings' weight-grads (first <-> last stage only).
+    # Barrier to all PP stages, charge it once per batch (after grad accumulation).
+    self._pp_embed_grad_time_per_batch = 0.0
+    if self.exe.training and self.exe.pipeline_par > 1 and self.app.tie_embeddings:
+      embed_grad_bytes = _grad_comm_bytes(self._embed_weight_elems_shard)
+      # Only the two owner stages participate in the all-reduce, so group size is 2.
+      self._pp_embed_grad_time_per_batch = self._pp_net.time('all_reduce', embed_grad_bytes, 2)
+
+    # TP comm for embedding / LM head
+    # Only owner pipeline stages pay this cost:
+    #  - Embedding owner: first stage always; last stage also when embeddings are tied
+    #      for capacity/optimizer/PP-AR, but TP FW AR for embedding happens only on the
+    #      first stage.
+    #  - LM head owner: last stage (both tied and untied; compute lives there).
+    self._tp_embed_fw_time_per_micro = 0.0
+    self._tp_embed_bw_time_per_micro = 0.0
+    self._tp_lm_head_fw_time_per_micro = 0.0
+    self._tp_lm_head_bw_time_per_micro = 0.0
+    if self.exe.tensor_par > 1:
+      owner_first = (self.exe.pipeline_par == 1) or (self.app.pp_stage_role == 'first')
+      owner_last = (self.exe.pipeline_par == 1) or (self.app.pp_stage_role == 'last')
+      act_bytes = self._activation_size * self._bytes_per_element
+      # Vocab-parallel embedding: FW needs TP AR of partial outputs; BW needs no TP collective.
+      if owner_first:
+        self._tp_embed_fw_time_per_micro = self._tp_net.time('all_reduce', act_bytes, self.exe.tensor_par)
+        self._tp_embed_bw_time_per_micro = 0.0
+      # LM head (on the last stage):
+      if owner_last:
+        # Vocab-parallel LM head with parallel cross-entropy.
+        # FW: no TP collective. BW: grad-input needs TP AR.
+        self._tp_lm_head_fw_time_per_micro = 0.0
+        if self.exe.training:
+          self._tp_lm_head_bw_time_per_micro = self._tp_net.time('all_reduce', act_bytes, self.exe.tensor_par)
+          # Vocab-parallel cross-entropy forward needs two small ARs over TP
+          ce_fw_bytes = self.exe.microbatch_size * self.app.seq_size * System.TypeSizes['float32']
+          self._tp_lm_head_fw_time_per_micro += 2 * self._tp_net.time('all_reduce', ce_fw_bytes, self.exe.tensor_par)
+        else:
+          self._tp_lm_head_bw_time_per_micro = 0.0
+
     # Total stats for compute and memory
     mult = self._blocks_per_proc * self.exe._num_microbatches
     self._fw_flops = mult * self._block_fw_flops
@@ -1616,6 +1722,65 @@ class Llm:
         (self._baseblocks_per_chunk * self._baseblock_recomm_time_exposed) +
         (self._edgeblocks_per_chunk * self._edgeblock_recomm_time_exposed))
 
+    def _gemm_processing_time(batch, m, n, k, read_bytes, write_bytes):
+      """
+      Returns processing time for a GEMM under the system model:
+      - flops_time uses matrix throughput (accounts for shape/efficiency);
+      - mem_time uses mem1 throughput (size-dependent efficiency);
+      - combined via system processing mode (roofline/no_overlap).
+      """
+      flops = 2.0 * batch * m * n * k
+      thr_mat = self.sys.get_matrix_throughput(batch=batch, m=m, n=n, k=k)
+      flops_time = 0.0 if thr_mat <= 0.0 else (flops / thr_mat)
+      bytes_total = read_bytes + write_bytes
+      thr_mem = self.sys.get_mem1_throughput(bytes_total)
+      mem_time = 0.0 if thr_mem <= 0.0 else (bytes_total / thr_mem)
+      return self.sys.get_processing_time(flops_time, mem_time)
+
+    self._lm_head_fw_comp_time_per_micro = 0.0
+    self._lm_head_bw_comp_time_per_micro = 0.0
+    assert self._padded_vocab > 0
+    V_shard = self._padded_vocab // self.exe.tensor_par
+    B = self.exe.microbatch_size
+    S = self.app.seq_size
+    H = self.app.hidden
+    e = self._bytes_per_element
+    # Forward GEMM: [B*S, H] x [H, V_shard] -> [B*S, V_shard]
+    #   read X + W, write Y
+    fw_reads = (B * S * H + H * V_shard) * e
+    fw_writes = (B * S * V_shard) * e
+    self._lm_head_fw_comp_time_per_micro = _gemm_processing_time(
+      batch=B, m=S, n=V_shard, k=H, read_bytes=fw_reads, write_bytes=fw_writes
+    )
+    # Backward:
+    # 1) dX GEMM: [B*S, V_shard] x [V_shard, H] -> [B*S, H]
+    bx_reads = (B * S * V_shard + H * V_shard) * e
+    bx_writes = (B * S * H) * e
+    t_dx = _gemm_processing_time(
+      batch=B, m=S, n=H, k=V_shard, read_bytes=bx_reads, write_bytes=bx_writes
+    )
+    # 2) dW GEMM (always executed; when tied, this contributes to the shared embedding weight):
+    #    [H, B*S] x [B*S, V_shard] -> [H, V_shard]
+    dw_reads = (B * S * H + B * S * V_shard) * e
+    dw_writes = (H * V_shard) * e
+    # Use batch=1 to reflect a single GEMM on (H, V_shard, B*S).
+    t_dw = _gemm_processing_time(
+      batch=1, m=H, n=V_shard, k=B*S, read_bytes=dw_reads, write_bytes=dw_writes
+    )
+    if self.exe.training:
+      self._lm_head_bw_comp_time_per_micro = t_dx + t_dw
+    else:
+      self._lm_head_bw_comp_time_per_micro = 0.0
+
+    # LM head per-micro FLOPs & bytes (for reporting only)
+    lm_fw_flops_per_micro = 2.0 * B * S * H * V_shard  # [B*S,H]x[H,V]
+    lm_dx_flops_per_micro = 2.0 * B * S * H * V_shard  # [B*S,V]x[V,H]
+    lm_dw_flops_per_micro = 2.0 * H * V_shard * (B * S)  # [H,B*S]x[B*S,V]
+
+    lm_fw_bytes_per_micro = fw_reads + fw_writes
+    lm_dx_bytes_per_micro = bx_reads + bx_writes
+    lm_dw_bytes_per_micro = dw_reads + dw_writes
+
     P_eff = self.exe.pipeline_par * self.exe.pipeline_interleaving
     owners = [i % self.exe.pipeline_par for i in range(P_eff)]
 
@@ -1655,6 +1820,15 @@ class Llm:
         pp_fw_stage[s] = fw_in + fw_out
         pp_bw_stage[s] = bw_in + bw_out
 
+    # Owner-local compute extras: LM head only lives on the last real stage.
+    # We add the extra compute time into the corresponding virtual stage period.
+    if P_eff > 0 and self.exe.pipeline_par > 1:
+      for s in range(P_eff):
+        if owners[s] == (self.exe.pipeline_par - 1):
+          pp_fw_stage[s] += self._lm_head_fw_comp_time_per_micro
+          if self.exe.training:
+            pp_bw_stage[s] += self._lm_head_bw_comp_time_per_micro
+
     # Choose this-rank's stage-period PP cost for block-level injection
     # consider interleaving by taking, for each owner (real rank), the max
     # across its virtual stages; since we don't know our rank here, use
@@ -1680,10 +1854,40 @@ class Llm:
 
     self._tp_comm_time_link = tp_fw_comm_time + tp_bw_comm_time
     self._tp_comm_time_exposed = tp_fw_comm_time_exposed + tp_bw_comm_time_exposed
+    # Add TP comm for embedding / LM head
+    tp_extra_link = self.exe._num_microbatches * (
+        self._tp_embed_fw_time_per_micro + self._tp_lm_head_fw_time_per_micro)
+    if self.exe.training:
+      tp_extra_link += self.exe._num_microbatches * (
+          self._tp_embed_bw_time_per_micro + self._tp_lm_head_bw_time_per_micro
+      )
+    self._tp_comm_time_link += tp_extra_link
+    self._tp_comm_time_exposed += tp_extra_link
     self._recomm_time_link = tp_recomm_time
     self._recomm_time_exposed = tp_recomm_time_exposed
     self._pp_comm_time_link = pp_fw_comm_time + pp_bw_comm_time
+    # Add PP AR for tied embeddings' weight-grads (backward-embedding-all-reduce).
+    # Once per batch iteration.
+    self._pp_comm_time_link += self._pp_embed_grad_time_per_batch
     self._pp_comm_time_exposed = self._pp_comm_time_link  # no-overlap ⇒ exposed == link
+
+    # Add LM-head compute to this-rank compute totals (owner last only).
+    owner_last_rank = (self.exe.pipeline_par == 1) or (self.app.pp_stage_role == 'last')
+    if owner_last_rank:
+      m = self.exe._num_microbatches
+      # Times
+      self._fw_time += m * self._lm_head_fw_comp_time_per_micro
+      if self.exe.training:
+        self._agrad_time += m * t_dx
+        self._wgrad_time += m * t_dw
+      # FLOPs & bytes accounting for LM head
+      self._fw_flops += m * lm_fw_flops_per_micro
+      self._fw_mem_accessed += m * lm_fw_bytes_per_micro
+      if self.exe.training:
+        self._agrad_flops += m * lm_dx_flops_per_micro
+        self._agrad_mem_accessed += m * lm_dx_bytes_per_micro
+        self._wgrad_flops += m * lm_dw_flops_per_micro
+        self._wgrad_mem_accessed += m * lm_dw_bytes_per_micro
 
     self.log.debug("%s %s", 'TP comm baseblock FW time:', self._baseblock_fw_tp_time)
     self.log.debug("%s %s", 'TP comm edgeblock FW time:', self._edgeblock_fw_tp_time)
@@ -1697,6 +1901,7 @@ class Llm:
     self.log.debug("%s %s", 'TP comm baseblock BW exposed time:', self._baseblock_agrad_tp_time_exposed)
     self.log.debug("%s %s", 'TP comm edgeblock BW exposed time:', self._edgeblock_agrad_tp_time_exposed)
     self.log.debug("%s %s", 'TP comm BW exposed time:', tp_bw_comm_time_exposed)
+    self.log.debug("%s %s", 'TP comm extra (embed/lm_head) link time:', tp_extra_link)
     self.log.debug("%s %s", 'PP comm chunk FW time:', chunk_fw_pp_time)
     self.log.debug("%s %s", 'PP comm chunk BW time:', chunk_bw_pp_time)
     self.log.debug("%s %s", 'PP comm FW time:', pp_fw_comm_time)
@@ -1723,7 +1928,7 @@ class Llm:
     # When we consider block BW time, we do not add optimizer step to it
     # because we have optimizer only for last microbatches, while offloading
     # works during the whole backward pass.
-    # Optimizer step is overall memory bound streaming task, itt is reasonable
+    # Optimizer step is overall memory bound streaming task, it is reasonable
     # to not overlap offloading with optimizer step
     self._baseblock_bw_time_no_offload = (
       self._block_re_time + self._baseblock_recomm_time_exposed +
@@ -1834,7 +2039,7 @@ class Llm:
     # Determines how long it takes to perform the DP per block
     # This assumes no DP communication overlap (will be adjusted later).
     if self.exe.data_par > 1 and self.exe.training:
-      self._block_dp_size = self._block_weight_space
+      self._block_dp_size = _grad_comm_bytes(self._block_weight_space // self._bytes_per_element)
       if self.exe.optimizer_sharding:
         # When performing optimizer sharding, the communication time is a
         # reduce-scatter plus an all-gather.
@@ -1989,6 +2194,34 @@ class Llm:
       self._dp_bw_overlap_req_chunk = 0
       self._dp_bw_overlap_req_tail = 0
 
+    # Add per-batch DP comm for embedding and LM-head
+    if self.exe.training and self.exe.data_par > 1:
+      dp_extra_time = 0.0
+      # Ownership:
+      #  - Embedding: first stage always owns; last stage also owns only when tied.
+      #  - Untied LM head: last stage owns.
+      owner_first = (self.exe.pipeline_par == 1) or (self.app.pp_stage_role == 'first')
+      owner_last = (self.exe.pipeline_par == 1) or (self.app.pp_stage_role == 'last')
+      # Token embedding shard (TP-sharded along vocab)
+      if owner_first or (self.app.tie_embeddings and owner_last):
+        emb_bytes = _grad_comm_bytes(self._embed_weight_elems_shard)
+        if self.exe.optimizer_sharding:
+          dp_extra_time += self._dp_net.time('reduce_scatter', emb_bytes, self.exe.data_par)
+          dp_extra_time += self._dp_net.time('all_gather',     emb_bytes, self.exe.data_par)
+        else:
+          dp_extra_time += self._dp_net.time('all_reduce',     emb_bytes, self.exe.data_par)
+      # Untied LM head shard only on the last stage (or PP==1)
+      if (not self.app.tie_embeddings) and owner_last:
+        lm_head_bytes = _grad_comm_bytes(self._lm_head_weight_elems_shard)
+        if self.exe.optimizer_sharding:
+          dp_extra_time += self._dp_net.time('reduce_scatter', lm_head_bytes, self.exe.data_par)
+          dp_extra_time += self._dp_net.time('all_gather',     lm_head_bytes, self.exe.data_par)
+        else:
+          dp_extra_time += self._dp_net.time('all_reduce',     lm_head_bytes, self.exe.data_par)
+      self._dp_comm_time_link    += dp_extra_time
+      self._dp_comm_time_exposed += dp_extra_time
+      self.log.debug('DP extra (emb/head) time (per-batch): %.3e', dp_extra_time)
+
     self.log.debug('Chunk FW time: %.3e', chunk_fw_time)
     self.log.debug('Chunk BW time: %.3e', chunk_bw_time)
     self.log.debug('Chunk BW time for DP overlap: %.3e', chunk_dp_overlap_time)
@@ -2066,6 +2299,34 @@ class Llm:
     else:
       self._weight_grad_space = 0
       self._optimizer_space = 0
+
+    # Add embedding / LM head capacity on owner stages
+    # Embedding owner: first stage always; last stage only when tied.
+    owner_first = (self.exe.pipeline_par == 1) or (self.app.pp_stage_role == 'first')
+    owner_last = (self.exe.pipeline_par == 1) or (self.app.pp_stage_role == 'last')
+    opt_shard = self.exe.data_par if self.exe.optimizer_sharding else 1
+    if owner_first or (self.app.tie_embeddings and owner_last):
+      # Token embedding shard
+      self._weight_space += self._embed_weight_elems_shard * self._bytes_per_element
+      # Weight grads: we keep one non-sharded copy before reduction, in FP32,
+      # plus (blocks_per_proc-1) sharded copies; however embeddings are a
+      # single "layer", so model 1× non-sharded only, matching Linear logic.
+      if self.exe.training:
+        # Non-sharded FP32 grad before reduction
+        self._weight_grad_space += self._embed_weight_elems_shard * System.TypeSizes['float32']
+        # Optimizer state (Adam): 2 FP32 moments; master weights only if
+        # training dtype is lower precision than FP32.
+        self._optimizer_space += (2 * self._embed_weight_elems_shard * System.TypeSizes['float32']) / opt_shard
+        if self.exe.datatype != 'float32':
+          self._optimizer_space += (self._embed_weight_elems_shard * System.TypeSizes['float32']) / opt_shard
+    # If embeddings are untied, add separate LM head on the last stage.
+    if (not self.app.tie_embeddings) and owner_last:
+      self._weight_space += self._lm_head_weight_elems_shard * self._bytes_per_element
+      if self.exe.training:
+        self._weight_grad_space += self._lm_head_weight_elems_shard * System.TypeSizes['float32']
+        self._optimizer_space += (2 * self._lm_head_weight_elems_shard * System.TypeSizes['float32']) / opt_shard
+        if self.exe.datatype != 'float32':
+          self._optimizer_space += (self._lm_head_weight_elems_shard * System.TypeSizes['float32']) / opt_shard
 
   def _check_mem_caps(self):
     if self.get_mem_tier1_cap_req() > self.sys.mem1.capacity:
@@ -2288,6 +2549,24 @@ class Llm:
       total_flops += sum(
         [block.get_agrad_flops() + block.get_wgrad_flops() + \
           block.get_optim_step_flops() for block in self._llm_block])
+    # Add LM-head FLOPs (per microbatch), but spread them evenly across
+    # blocks so the caller's multiplication by blocks_per_proc yields
+    # the correct per-rank total.
+    owner_last = (self.exe.pipeline_par == 1) or (self.app.pp_stage_role == 'last')
+    if owner_last:
+      B = self.exe.microbatch_size
+      S = self.app.seq_size
+      H = self.app.hidden
+      V_shard = self._padded_vocab // self.exe.tensor_par
+      lm_fw = 2.0 * B * S * H * V_shard      # [B*S,H] x [H,V_shard]
+      if self.exe.training:
+        lm_dx = 2.0 * B * S * H * V_shard    # [B*S,V] x [V,H]
+        lm_dw = 2.0 * H * V_shard * (B * S)  # [H,B*S] x [B*S,V]
+        lm_total = lm_fw + lm_dx + lm_dw
+      else:
+        lm_total = lm_fw
+      denom = max(1, self._blocks_per_proc)
+      total_flops += lm_total / denom
     return total_flops
 
   def get_compute_efficiency(self):
@@ -2296,21 +2575,29 @@ class Llm:
       self.get_optim_step_time()
     perfect_time = self._blocks_per_proc * self.exe._num_microbatches * \
       total_flops / self.sys.matrix.flops(self.exe.datatype)
-    return perfect_time / compute_time
+    return perfect_time / max(compute_time, 1e-12)
 
   def get_system_efficiency(self):
     compute_time = self.get_fw_time() + self.get_bw_time() + \
       self.get_optim_step_time()
-    return compute_time / self.get_total_time()
+    return compute_time / max(self.get_total_time(), 1e-12)
 
   def get_total_efficiency(self):
     total_flops = self.get_useful_flops()
     perfect_time = self._blocks_per_proc * self.exe._num_microbatches * \
       total_flops / self.sys.matrix.flops(self.exe.datatype)
-    return perfect_time / self.get_total_time()
+    return perfect_time / max(self.get_total_time(), 1e-12)
 
   def get_weight_space_min(self):
-    return self._block_weight_space * 2
+    """
+    Minimum tier-1 capacity needed for weights on this rank.
+    Double-buffer only when weight offload is enabled (for overlap).
+    Otherwise, one copy is sufficient.
+    """
+    if self.exe.weight_offload:
+      return 2 * self._block_weight_space
+    else:
+      return self._block_weight_space
 
   def get_weight_space(self):
     return self._weight_space
@@ -2330,6 +2617,8 @@ class Llm:
         return 0
       else:
         return self._block_act_checkpoint_size * 2
+    else:
+      return 0
 
   def get_act_checkpoint_size(self):
     if self.exe.training:
@@ -2425,7 +2714,7 @@ class Llm:
     offload_time = min(
       self._baseblock_fw_time_no_offload - self._block_fw_mem_time,
       self._edgeblock_fw_time_no_offload - self._block_fw_mem_time)
-    return act_offload_size / offload_time
+    return act_offload_size / max(offload_time, 1e-12)
 
   def get_weight_offload_bw_req(self):
     # We should be able to offload (write) and prefetch (read) weights both
@@ -2434,7 +2723,7 @@ class Llm:
     offload_time = min(
       self._baseblock_fw_time_no_offload - self._block_fw_mem_time,
       self._edgeblock_fw_time_no_offload - self._block_fw_mem_time)
-    return self._block_weight_space / offload_time
+    return self._block_weight_space / max(offload_time, 1e-12)
 
   def get_optim_offload_bw_req(self):
     # We should be able to offload (write) weight grads and optimizer state
@@ -2447,7 +2736,7 @@ class Llm:
         self._edgeblock_bw_time_no_offload - (self._block_agrad_mem_time +
           self._block_wgrad_mem_time))
       return (self._block_weight_grad_space + self._block_optimizer_space) / \
-        offload_time
+        max(offload_time, 1e-12)
     else:
       return 0
 
@@ -2461,11 +2750,11 @@ class Llm:
           self._block_wgrad_mem_time),
         self._edgeblock_bw_time_no_offload - (self._block_agrad_mem_time +
           self._block_wgrad_mem_time))
-      req_bw = max(self._get_fw_offload_size() / fw_offload_time,
-                   self._get_bw_offload_size() / bw_offload_time)
+      req_bw = max(self._get_fw_offload_size() / max(fw_offload_time, 1e-12),
+                   self._get_bw_offload_size() / max(bw_offload_time, 1e-12))
       return req_bw
     else:
-      return self._get_fw_offload_size() / fw_offload_time
+      return self._get_fw_offload_size() / max(fw_offload_time, 1e-12)
 
   def get_sample_rate(self):
     return self.exe.global_batch_size / self.get_total_time()
@@ -2516,8 +2805,6 @@ class Llm:
       f"{human_format(self.get_mem_tier1_cap_req(), 'bytes')};\n" \
       f"Mem tier2 capacity requirement: " \
       f"{human_format(self.get_mem_tier2_cap_req(), 'bytes')};\n" \
-      f"Mem tier2 BW for offload: " \
-      f"{human_format(self.get_offload_mem_bw_req(), 'bandwidth')};\n" \
       f"Compute efficiency: {self.get_compute_efficiency()*100:.2f}%;\n" \
       f"System efficiency: {self.get_system_efficiency()*100:.2f}%;\n" \
       f"Total efficiency: {self.get_total_efficiency()*100:.2f}%;\n" \

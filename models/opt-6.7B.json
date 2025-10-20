@@ -4,5 +4,6 @@
   "seq_size": 512,
   "attn_heads": 32,
   "attn_size": 128,
-  "num_blocks": 32
+  "num_blocks": 32,
+  "vocab_size": 51200
 }

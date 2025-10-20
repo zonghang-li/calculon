@@ -67,7 +67,7 @@
 //   Max allowed total bytes per tested shape: B*(A+B+C). Default is ~80% of
 //   current free device memory. Increase to admit larger shapes.
 // REPS_AUTO_TARGET_MS=<double>
-//   Auto-tune repetitions so that each (B,M,N,K) accumulates ~this many ms
+//   Auto-tune repetitions so that each (B,M,N,K) accumulates this many ms
 //   total in the timed loop (default: 35 ms).
 //
 // Progress & Logging

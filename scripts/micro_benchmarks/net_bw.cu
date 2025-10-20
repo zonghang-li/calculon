@@ -806,27 +806,15 @@ int main(){
   std::fputc('\n', stdout);
   std::fflush(stdout);
 
-  // ---------- Save JSON to timestamped file (gemm_bench-like UX) ----------
-  std::string builds_dir = "builds";
-  (void)ensure_dir(builds_dir);
-
-  std::string stamp = timestamp_yyyyMMdd_HHmmss();
-  long pid = get_pid();
-
-  std::ostringstream run_dir_oss;
-  run_dir_oss << builds_dir << "/net_run_" << stamp << "_" << pid;
-  std::string run_dir = run_dir_oss.str();
-  (void)ensure_dir(run_dir);
-
-  std::string out_path = run_dir + "/net_bw.json";
+  // ---------- Save JSON to ./net_bw.json ----------
+  std::string out_path = "./net_bw.json";
 
   std::ofstream f(out_path, std::ios::out | std::ios::trunc | std::ios::binary);
   if(f){
     f.write(json.data(), (std::streamsize)json.size());
     f.close();
-    std::fprintf(stderr, "Wrote JSON: %s\n", out_path.c_str());
   }else{
-    std::fprintf(stderr, "Failed to write JSON to %s\n", out_path.c_str());
+    std::fprintf(stderr, "Failed to write JSON\n");
   }
 
   return 0;

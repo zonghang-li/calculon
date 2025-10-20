@@ -90,6 +90,9 @@
 # Don't reuse prior GEMM benchmarks (./gemm_bench.json):
 #   RERUN_GEMM_BENCH=1 ./main.sh
 #
+# Don't reuse prior network benchmarks (./net_bw.json):
+#   RERUN_NET_BENCH=1 ./main.sh
+#
 # Run GEMM faster with a thinned grid:
 #   FAST=1 ./main.sh
 #
@@ -148,6 +151,7 @@ SOURCES=(gemm_bench.cu eltwise_fma.cu gpu_info.cu mem_bw.cu net_bw.cu)
 
 FORCE_REBUILD=${FORCE_REBUILD:-0}            # set to 1 to force rebuilds
 RERUN_GEMM_BENCH=${RERUN_GEMM_BENCH:-false}  # default: false (do not re-run by default)
+RERUN_NET_BENCH=${RERUN_NET_BENCH:-false}    # default: false (do not re-run by default)
 
 # -------------------------- Env knobs (forwarding) ---------------------------
 # Added MB_DIMS and MB_DIM_STRIDE; kept TOPK_PRINT for compatibility.
@@ -496,7 +500,7 @@ case "${RERUN_NET_BENCH,,}" in
   0|false|no|off) net_reuse=true ;;
 esac
 
-if [[ $SKIP_NET -eq 0 && -x "$BUILD_DIR/net_bw" ]]; then
+if [[ -x "$BUILD_DIR/net_bw" ]]; then
   if [[ "$net_reuse" == true && -f "$NET_JSON" ]]; then
     log_step "Using existing net_bw.json (RERUN_NET_BENCH=false)"
     if [[ -s "$NET_JSON" ]]; then
@@ -546,11 +550,7 @@ if [[ $SKIP_NET -eq 0 && -x "$BUILD_DIR/net_bw" ]]; then
   fi
 else
   NET_ARR="[]"
-  if [[ $SKIP_NET -eq 1 ]]; then
-    log_warn "Skipping net_bw by request (SKIP_NET=1)"
-  else
-    log_warn "net_bw binary missing; networks will be []"
-  fi
+  log_warn "net_bw binary missing; networks will be []"
 fi
 
 # --------------------------- 4) JSON defaults/validation ---------------------

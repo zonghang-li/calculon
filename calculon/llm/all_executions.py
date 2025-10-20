@@ -16,18 +16,15 @@
 """
 
 import datetime
-import gzip
 import itertools
 import logging
 import math
 import multiprocessing as mp
-import os
-import pandas
 import psutil
 import random
+from tqdm import tqdm
 
 import calculon
-from calculon.util import pick, arg_true_false_all
 from calculon.llm import *
 
 
@@ -64,16 +61,6 @@ class AllExecutions(calculon.CommandLine):
                     default='true', help='Mode of fused activation')
 
   @staticmethod
-  def execution_fields():
-    return (
-      'num_procs', 'tensor_par', 'pipeline_par', 'data_par', 'tensor_par_net',
-      'pipeline_par_net', 'data_par_net', 'batch_size', 'microbatch_size',
-      'datatype', 'fused_activation', 'attention_type', 'activation_recompute',
-      'pipeline_interleaving', 'optimizer_sharding', 'tensor_par_comm_type',
-      'tensor_par_overlap', 'seq_par_ag_redo', 'data_par_overlap',
-      'weight_offload', 'activations_offload', 'optimizer_offload', 'training')
-
-  @staticmethod
   def get_batch_size(data_par, max_batch_size):
     if data_par > max_batch_size:
       return None
@@ -89,20 +76,16 @@ class AllExecutions(calculon.CommandLine):
     has_mem2 = syst.mem2.capacity > 0
     num_nets = syst.num_networks
     count = 0
-    for tp in Llm.get_all_tensor_parallelisms(
-        num_procs, app.hidden, app.attn_heads, app.kv_groups):
-      for pp in Llm.get_all_pipeline_parallelisms(
-          num_procs, tp, app.num_blocks):
+    for tp in Llm.get_all_tensor_parallelisms(num_procs, app.hidden, app.attn_heads, app.kv_groups):
+      for pp in Llm.get_all_pipeline_parallelisms(num_procs, tp, app.num_blocks):
         dp = Llm.get_data_parallelism(num_procs, tp, pp)
         for ppint in Llm.get_valid_pipeline_interleavings(app.num_blocks, pp):
           batch_size = AllExecutions.get_batch_size(dp, max_batch_size)
-          if batch_size is None:
-            continue
+          if batch_size is None: continue
           for activation_recompute in ['full', 'attn_only', 'none']:
             for optimizer_sharding in pick(dp>1, [True, False], [False]):
               for tensor_par_comm_type in ['ar', 'p2p_rs_ag', 'rs_ag']:
-                can_redo = Llm.can_redo_ag(tensor_par_comm_type,
-                                           activation_recompute)
+                can_redo = Llm.can_redo_ag(tensor_par_comm_type, activation_recompute)
                 for seq_par_ag_redo in pick(can_redo, [True, False], [False]):
                   for data_par_overlap in pick(dp>1, [True, False], [False]):
                     for tensor_par_overlap in pick(tp>1, ['none', 'ring', 'pipe'], ['none']):
@@ -112,23 +95,26 @@ class AllExecutions(calculon.CommandLine):
                         else:
                           activations_offloads = [True, False]
                         for activations_offload in activations_offloads:
-                          for optimizer_offload in pick(has_mem2, [True, False],
-                                                        [False]):
+                          for optimizer_offload in pick(has_mem2, [True, False], [False]):
                             for fused_act in fused_activation:
                               for microbatch_size in Llm.get_valid_microbatch_sizes(
-                                  app.seq_size, tp, dp, batch_size, pp):
+                                  app.seq_size, tp, dp, batch_size, pp, tensor_par_comm_type):
                                 for tn in pick(tp>1, range(num_nets), [0]):
                                   for pn in pick(pp>1, range(num_nets), [0]):
                                     for dn in pick(dp>1, range(num_nets), [0]):
                                       yield (num_procs, tp, pp, dp, tn, pn, dn,
                                              batch_size, microbatch_size, datatype,
-                                             fused_act, 'multihead', activation_recompute,
+                                             fused_act, True, 'multihead', activation_recompute,
                                              ppint, optimizer_sharding, tensor_par_comm_type,
                                              tensor_par_overlap, seq_par_ag_redo,
                                              data_par_overlap, weight_offload,
                                              activations_offload, optimizer_offload,
-                                             True)
+                                             True, True)
                                       count += 1
+
+  @staticmethod
+  def _search_star(args):
+    return AllExecutions.search(*args)
 
   @staticmethod
   def run_command(logger, args):
@@ -153,7 +139,10 @@ class AllExecutions(calculon.CommandLine):
     # Runs parallel searches
     start_time = datetime.datetime.now()
     with mp.Pool(args.cpus) as pool:
-      goods = pool.starmap(AllExecutions.search, worker_args)
+      goods = []
+      for g in tqdm(pool.imap_unordered(AllExecutions._search_star, worker_args),
+          total=len(worker_args), desc="Evaluating executions", unit="chunk"):
+        goods.append(g)
     end_time = datetime.datetime.now()
     good_count = sum(len(good) for good in goods)
 

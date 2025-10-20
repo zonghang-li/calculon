@@ -16,15 +16,17 @@
 """
 
 import datetime
-import gzip
 import logging
 import multiprocessing as mp
 import psutil
-import os
+from tqdm import tqdm
 
 import calculon
-from calculon.util import pick, arg_true_false_all
 from calculon.llm import *
+
+
+def _search_star(args):
+  return OptimalExecution.search(*args)
 
 
 class OptimalExecution(calculon.CommandLine):
@@ -77,15 +79,12 @@ class OptimalExecution(calculon.CommandLine):
     syst = System(calculon.io.read_json_file(args.system))
 
     params = []
-    for tp in Llm.get_all_tensor_parallelisms(
-        args.num_procs, app.hidden, app.attn_heads, app.kv_groups):
-      for pp in Llm.get_all_pipeline_parallelisms(
-          args.num_procs, tp, app.num_blocks):
+    for tp in Llm.get_all_tensor_parallelisms(args.num_procs, app.hidden, app.attn_heads, app.kv_groups):
+      for pp in Llm.get_all_pipeline_parallelisms(args.num_procs, tp, app.num_blocks):
         dp = Llm.get_data_parallelism(args.num_procs, tp, pp)
         for ppint in Llm.get_valid_pipeline_interleavings(app.num_blocks, pp):
           batch_size = OptimalExecution.get_batch_size(dp, args.max_batch_size)
-          if batch_size is None:
-            continue
+          if batch_size is None: continue
           for activation_recompute in ['full', 'attn_only', 'none']:
             for optimizer_sharding in pick(dp>1, [True, False], [False]):
               for tensor_par_comm_type in ['ar', 'p2p_rs_ag', 'rs_ag']:
@@ -99,7 +98,10 @@ class OptimalExecution(calculon.CommandLine):
     # Runs parallel searches
     start_time = datetime.datetime.now()
     with mp.Pool(args.cpus) as pool:
-      searches = pool.starmap(OptimalExecution.search, params)
+      searches = []
+      for res in tqdm(pool.imap_unordered(_search_star, params),
+                      total=len(params), desc='Searching', smoothing=0.05):
+        searches.append(res)
     end_time = datetime.datetime.now()
 
     # Combines parallel search result into one data structure
@@ -178,32 +180,25 @@ class OptimalExecution(calculon.CommandLine):
              optimizer_sharding, tensor_par_comm_type, fused_acts, mbs_break,
              allow_tp_overlap, allow_dp_overlap):
     num_nets = syst.num_networks
-
     best = []
     exe_count = 0
     good_exe_count = 0
     bad_exe_count = 0
-
     has_mem2 = syst.mem2.capacity > 0
-
-    can_redo = Llm.can_redo_ag(tensor_par_comm_type,
-                               activation_recompute)
+    can_redo = Llm.can_redo_ag(tensor_par_comm_type, activation_recompute)
     for seq_par_ag_redo in pick(can_redo, [True, False], [False]):
-      for data_par_overlap in pick(dp>1 and allow_dp_overlap, [True, False],
-                                   [False]):
-        for tensor_par_overlap in pick(tp>1 and allow_tp_overlap,
-                                       ['none', 'ring', 'pipe'], ['none']):
+      for data_par_overlap in pick(dp>1 and allow_dp_overlap, [True, False], [False]):
+        for tensor_par_overlap in pick(tp>1 and allow_tp_overlap, ['none', 'ring', 'pipe'], ['none']):
           for weight_offload in pick(has_mem2, [True, False], [False]):
             if activation_recompute == 'full' or not has_mem2:
               activations_offloads = [False]
             else:
               activations_offloads = [True, False]
             for activations_offload in activations_offloads:
-              for optimizer_offload in pick(has_mem2, [True, False],
-                                            [False]):
+              for optimizer_offload in pick(has_mem2, [True, False], [False]):
                 for fused_act in fused_acts:
                   for microbatch_size in Llm.get_valid_microbatch_sizes(
-                      app.seq_size, tp, dp, batch_size, pp):
+                      app.seq_size, tp, dp, batch_size, pp, tensor_par_comm_type):
                     mbs_break_good = good_exe_count
                     for tn in pick(tp>1, range(num_nets), [0]):
                       for pn in pick(pp>1, range(num_nets), [0]):
@@ -221,6 +216,8 @@ class OptimalExecution(calculon.CommandLine):
                             'microbatch_size': microbatch_size,
                             'datatype': datatype,
                             'fused_activation': fused_act,
+                            'qkv_packing': True,
+                            'grad_reduce_in_fp32': False,
                             'attention_type': 'multihead',
                             'activation_recompute': activation_recompute,
                             'pipeline_interleaving': ppint,
@@ -234,7 +231,6 @@ class OptimalExecution(calculon.CommandLine):
                             'optimizer_offload': optimizer_offload,
                             'training': True
                           }
-
                           if not debug:
                             try:
                               logger = logging.Logger('sub')
