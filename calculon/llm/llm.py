@@ -701,8 +701,7 @@ class Llm:
     self._llm_block.append(Fork(
       "AttnBlock_Fork",
       self.sys,
-      pick(self.exe._sequence_par, self._seq_par_activation_size,
-           self._activation_size),
+      pick(self.exe._sequence_par, self._seq_par_activation_size, self._activation_size),
       2,
       needs_recompute=recompute_flag,
       # We account this activation when consider Residual and LayerNorm
@@ -710,8 +709,7 @@ class Llm:
     self._llm_block.append(LayerNorm(
       "AttnBlock_LayerNorm",
       self.sys,
-      pick(self.exe._sequence_par, self._seq_par_activation_size,
-           self._activation_size),
+      pick(self.exe._sequence_par, self._seq_par_activation_size, self._activation_size),
       self.app.hidden,
       needs_recompute=recompute_flag,
       # Activation is stored in Fork instead
@@ -1003,8 +1001,7 @@ class Llm:
     self._llm_block.append(Fork(
       "MlpBlock_Fork",
       self.sys,
-      pick(self.exe._sequence_par, self._seq_par_activation_size,
-           self._activation_size),
+      pick(self.exe._sequence_par, self._seq_par_activation_size, self._activation_size),
       2,
       needs_recompute=recompute_flag,
       # We account this activation when consider Residual and LayerNorm
@@ -1012,8 +1009,7 @@ class Llm:
     self._llm_block.append(LayerNorm(
       "MlpBlock_LayerNorm",
       self.sys,
-      pick(self.exe._sequence_par, self._seq_par_activation_size,
-           self._activation_size),
+      pick(self.exe._sequence_par, self._seq_par_activation_size, self._activation_size),
       self.app.hidden,
       needs_recompute=recompute_flag,
       # Activation is stored in Fork instead
@@ -1117,10 +1113,8 @@ class Llm:
     self._llm_block.append(ElementWise(
       "MlpBlock_Residual",
       self.sys,
-      pick(self.exe._sequence_par, self._seq_par_activation_size,
-           self._activation_size),
-      pick(self.exe._sequence_par, self._seq_par_activation_size,
-           self._activation_size),
+      pick(self.exe._sequence_par, self._seq_par_activation_size, self._activation_size),
+      pick(self.exe._sequence_par, self._seq_par_activation_size, self._activation_size),
       needs_recompute=recompute_flag,
       # Activation is stored in Fork instead
       activation_stored=False,
@@ -1294,6 +1288,7 @@ class Llm:
     # Memory footprints (capacity)
     self._block_weight_space = 0            # Sum of all parameter bytes for this block
     self._block_act_working_space = 0       # Sum of working activation bytes that are not flagged as “reused elsewhere”
+    self._block_act_working_peak = 0        # Peak working-set across layers (realistic for PP=1)
     self._block_act_storage_space = 0       # Sum of stored activations that persist for BW (before global recompute overrides)
 
     # Recompute (re‑executed FW during BW when checkpointing)
@@ -1437,7 +1432,12 @@ class Llm:
       # Footprint (memory capacity, bytes) per block
       self._block_weight_space += layer.get_weight()              # parameters
       if not layer.reuses_activation():
-        self._block_act_working_space += layer.get_activation()   # working activations
+        # Cache the activation size once and track a *peak* working-set for PP=1:
+        # activations from different layers don’t live at the same time, so summing would
+        # double-count; the resident footprint is the max per-layer working activation.
+        act_size_ = layer.get_activation()
+        self._block_act_working_space += act_size_                # working activations
+        self._block_act_working_peak = max(self._block_act_working_peak, act_size_)  # peak working-set for PP=1
       self._block_act_storage_space += layer.get_activation()     # stored activations
 
       if self.exe.training:
@@ -1613,6 +1613,17 @@ class Llm:
                    human_format(self._edgeblock_recomm_size, 'bytes'))
     self.log.debug("%s %s", 'TP comm required bandwidth for tiled overlap:',
                    human_format(self._tp_bw_overlap_req, 'bandwidth'))
+
+  def _micros_in_flight(self) -> float:
+    """
+    Resident microbatches for capacity accounting.
+    Under 1F1B, at any instant a stage holds at most min(M, PP) micros.
+    Do not include warm-up/flush stretch factors here (those are time effects).
+    """
+    pp = int(getattr(self.exe, "pipeline_par", 1))
+    if pp <= 1: return 1.0
+    num_micros = int(getattr(self.exe, "_num_microbatches", 1))
+    return float(min(num_micros, pp))
 
   def _compute_batch_stats(self):
     """
@@ -2078,14 +2089,11 @@ class Llm:
         # in the last chunk we can overlap only all blocks except for the last
         num_overlappable_chunks = self.exe.pipeline_interleaving - 1
         last_chunk_overlap_size = self._blocks_per_chunk - 1
-        # We can overlap DP with BW pass, overlap[ing AR for previous layer
-        # with BW for current, except when optimizer sharded. We can't overlap
-        # during optimizer step as we RS grads before step and AG weights after
-        # Overlappable chunks have overlap size equal to
-        # blocks_per_chunk * num_microbatches
-        # In case of 1F1B schedule, num_microbatches == pipeline_par
-        overlap_window = self.exe.pipeline_par * chunk_dp_overlap_time
-        overlap_compute = self.exe.pipeline_par * chunk_dp_compute_time
+        # We can overlap DP with BW pass, overlapping AR for previous layer
+        # with BW for current, except when optimizer sharded.
+        micros_in_flight = min(self.exe._num_microbatches, self.exe.pipeline_par)
+        overlap_window = micros_in_flight * chunk_dp_overlap_time
+        overlap_compute = micros_in_flight * chunk_dp_compute_time
         chunk_dp_time = self._blocks_per_chunk * self._block_dp_time
         # We may have PP and DP comm colliding if DP comm takes longer than
         # a single chunk BW time. We can't collide more PP than microbatches
@@ -2234,52 +2242,41 @@ class Llm:
 
     # memory capacity stats
     self._weight_space = self._block_weight_space * self._blocks_per_proc
-    # account for activation recomputation
-    # for full recompute we keep single block's activations
+    # account for activation recomputation for full recompute we keep single block's activations
     # (no scaling by L/gpu)
     if self.exe.training:
-      # With 1F1B schedule we only keep `pipeline_par` microbatches
-      # If num_microbatches < PP, we keep num_microbatches for all PP stages
-      if self.exe._num_microbatches < self.exe.pipeline_par:
-        mem_microbatches = self.exe._num_microbatches
-      else:
-        mem_microbatches = self.exe.pipeline_par
+      mem_microbatches = min(self.exe._num_microbatches, self.exe.pipeline_par)
       if self.exe.activation_recompute == "full":
         assert self._block_act_storage_space == 0, \
           "We expect with full act recomputation we recompute ALL activations"
-        self._act_space = self._block_act_working_space
-        # We would need to store checkpoints for all microbatches before we
-        # compute BW pass with regular schedule, but we ONLY use 1F1B schedule
-        self._act_checkpoint_size = self._blocks_per_proc * \
-          self._block_act_checkpoint_size
-        # Keep activation checkpoints for all pipeline stages for PP
-        if self.exe.pipeline_interleaving > 1:
-          self._act_checkpoint_size *= mem_microbatches * (
-            1 + (self.exe.pipeline_par - 1) / (self.exe.pipeline_interleaving *
-                                               self.exe.pipeline_par))
-        else:
-          assert self.exe.pipeline_interleaving == 1
-          self._act_checkpoint_size *= mem_microbatches
+        self._act_space = self._block_act_working_peak
+        self._act_checkpoint_size = (
+            self._blocks_per_proc * self._block_act_checkpoint_size * mem_microbatches)
       else:
         # Without full recompute, we don't need checkpoints
         self._act_checkpoint_size = 0
-        # Without full recompute, we keep activations for all blocks on the GPU,
-        # one activation for working block, and activation for other blocks for
-        # all pipeline stages w.r.t. interleaved 1F1B schedule
-        if self.exe.pipeline_interleaving > 1:
-          pp_microbatch_factor = mem_microbatches * (
-            1 + (self.exe.pipeline_par - 1) / (self.exe.pipeline_interleaving *
-                                               self.exe.pipeline_par))
+        if self.exe.pipeline_par == 1:
+          # PP=1: sequential; keep peak working for current block + stored for all previous blocks
+          self._act_space = (
+              self._block_act_working_peak +
+              self._block_act_storage_space * (self._blocks_per_proc - 1)
+          )
         else:
-          assert self.exe.pipeline_interleaving == 1
-          pp_microbatch_factor = mem_microbatches
-        self._act_space = self._block_act_working_space + \
-          self._block_act_storage_space * (
-            self._blocks_per_proc * pp_microbatch_factor - 1)
+          # PP>1: at most mem_microbatches micros resident on a stage
+          # working set is a *peak* of one block; stored activations per micro are sum over this stage
+          self._act_space = (
+              self._block_act_working_peak +
+              self._block_act_storage_space * (self._blocks_per_proc * mem_microbatches)
+          )
       # Only need activation grads for a single block
       self._act_grad_space = self._block_act_grad_space
     else:
-      self._act_space = self._block_act_working_space
+      # Inference: PP=1 still benefits from working-peak.
+      if self.exe.pipeline_par == 1:
+        self._act_space = self._block_act_working_peak + \
+          self._block_act_storage_space * (self._blocks_per_proc - 1)
+      else:
+        self._act_space = self._block_act_working_peak
       self._act_checkpoint_size = 0
       self._act_grad_space = 0
 
@@ -2603,10 +2600,24 @@ class Llm:
     return self._weight_space
 
   def get_act_space_min(self):
+    """
+    Minimum tier-1 activation capacity required on this rank (bytes).
+    - PP=1: peak working set for the current block + stored activations for the
+      remaining (blocks_per_proc-1) blocks in the stage.
+    - PP>1: at most min(num_microbatches, PP) micros are resident; stored
+      activations scale with blocks_per_proc * mem_microbatches.
+    - With full activation recompute, only the per-block peak working set is kept.
+    """
     if self.exe.activation_recompute != 'full':
-      return self._block_act_working_space + self._block_act_storage_space
+      if self.exe.pipeline_par == 1:
+        return self._block_act_working_peak + \
+          self._block_act_storage_space * (self._blocks_per_proc - 1)
+      else:
+        mem_microbatches = min(self.exe._num_microbatches, self.exe.pipeline_par)
+        return self._block_act_working_peak + \
+          self._block_act_storage_space * (self._blocks_per_proc * mem_microbatches)
     else:
-      return self._block_act_working_space
+      return self._block_act_working_peak
 
   def get_act_space(self):
     return self._act_space
@@ -2666,36 +2677,73 @@ class Llm:
       return 0
 
   def _get_mem_cap_reqs(self):
-    tier1 = 0
-    tier2 = 0
-    if self.exe.weight_offload:
-      tier1 += self.get_weight_space_min()
-      tier2 += self.get_weight_space()
-    else:
-      tier1 += self.get_weight_space()
-    if self.exe.activations_offload:
-      if self.exe.activation_recompute != 'full':
-        tier1 += self.get_act_space_min()
-        tier2 += self.get_act_space()
+    """
+    This method models the peak memory footprint of a transformer stage
+    under realistic parallelism (TP/PP/DP) and overlap behavior.
+
+    Rather than simply summing all tensor spaces, it approximates the
+    true temporal residency of major memory components — weights,
+    optimizer states, forward activations, and gradients — and distinguishes:
+      • Forward-dominated peaks (when activations dominate memory)
+      • Backward-dominated peaks (when gradients dominate memory)
+      • Their partial overlap (when both coexist briefly in PP=1 or 1F1B)
+
+    For offload cases, it separates device-resident (tier1) and offloaded
+    (tier2) memory to reflect multi-tier memory hierarchies realistically.
+    """
+    if self.exe.weight_offload or self.exe.activations_offload or self.exe.optimizer_offload:
+      tier1 = 0
+      tier2 = 0
+      if self.exe.weight_offload:
+        tier1 += self.get_weight_space_min()
+        tier2 += self.get_weight_space()
       else:
-        tier1 += self.get_act_space_min()
-        tier1 += self.get_act_checkpoint_size_min()
-        tier2 += self.get_act_checkpoint_size()
+        tier1 += self.get_weight_space()
+
+      if self.exe.activations_offload:
+        if self.exe.activation_recompute != 'full':
+          tier1 += self.get_act_space_min()
+          tier2 += self.get_act_space()
+        else:
+          tier1 += self.get_act_space_min()
+          tier1 += self.get_act_checkpoint_size_min()
+          tier2 += self.get_act_checkpoint_size()
+      else:
+        tier1 += self.get_act_space()
+        tier1 += self.get_act_checkpoint_size()
+
+      if self.exe.optimizer_offload:
+        tier1 += self.get_weight_grad_space_min()
+        tier1 += self.get_optimizer_space_min()
+        tier2 += self._block_weight_grad_space * self._blocks_per_proc
+        tier2 += self.get_optimizer_space()
+      else:
+        tier1 += self.get_weight_grad_space() + self.get_optimizer_space()
+
+      tier1 += self.get_act_grad_space()
+      return tier1, tier2
+
+    # No offload: base components
+    W = self.get_weight_space()
+    OPT = self.get_optimizer_space() if self.exe.training else 0
+    ACT = self.get_act_space() + self.get_act_checkpoint_size()
+    AG = self.get_act_grad_space() if self.exe.training else 0
+    fw_peak = W + OPT + ACT
+
+    bytes_param = System.TypeSizes[self.exe.datatype]
+    bytes_grad = System.TypeSizes['float32'] if self.exe.grad_reduce_in_fp32 else bytes_param
+    MG = int((W / max(bytes_param, 1)) * bytes_grad) if self.exe.training else 0
+
+    # PP>1: Megatron-style reserved max — forward activations + main grad + act grad
+    if self.exe.training and self.exe.pipeline_par > 1:
+      return fw_peak + MG + AG, 0
+
+    # PP=1
+    overlap_threshold = 1.25
+    if self.exe.training and (ACT <= overlap_threshold * MG):
+      return max(fw_peak, fw_peak + MG + AG), 0
     else:
-      tier1 += self.get_act_space()
-      tier1 += self.get_act_checkpoint_size()
-    if self.exe.optimizer_offload:
-      # We keep one set of non-sharded weight grads after compute before
-      # reduction, and one sharded set for offloading
-      tier1 += self.get_weight_grad_space_min()
-      tier1 += self.get_optimizer_space_min()
-      tier2 += self._block_weight_grad_space * self._blocks_per_proc
-      tier2 += self.get_optimizer_space()
-    else:
-      tier1 += self.get_weight_grad_space() + \
-        self.get_optimizer_space()
-    tier1 += self.get_act_grad_space()
-    return tier1, tier2
+      return fw_peak, 0
 
   def get_mem_tier1_cap_req(self):
     return self._get_mem_cap_reqs()[0]
