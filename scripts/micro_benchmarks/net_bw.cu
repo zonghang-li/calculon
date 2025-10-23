@@ -1,126 +1,121 @@
-/**
- * net_bw.cu — single-node network/comms micro-benchmark (CUDA + NCCL optional)
- *
- * What this program measures
- * --------------------------
- * Quickly characterizes “Megatron-like” communication on a single node across 2/4/8 GPUs:
- *   • PP (pipeline-parallel) steady-state 1F1B traffic between adjacent ranks
- *     using ncclSend/ncclRecv (or cudaMemcpyPeer when built with NO_NCCL).
- *   • AR (data/tensor-parallel) NCCL AllReduce (ring) bus bandwidth.
- *   • A small-message one-way P2P latency via 4 KiB cudaMemcpyPeer.
- *
- * Megatron-LM alignment
- * ---------------------
- * • By default, lets NCCL auto-select algorithm/protocol/rings — mirroring Megatron-LM.
- * • You can pin a deterministic config for A/B by setting: PIN_NCCL=1
- *   (Ring algo, Simple proto, 1 ring, CollNet disabled).
- * • Logging is quiet by default (NCCL_DEBUG=ERROR) unless you override it.
- *
- * Output (file)
- * -------------
- * Writes JSON to: ./net_bw.json
- *
- * Schema (abridged):
- * {
- *   "networks": [
- *     {
- *       "bandwidth": <theory_GBps>,         // single-link “theory” GB/s used for normalization
- *       "pp_efficiency": [[MiB, eff], ...], // size-binned PP efficiencies (including [0, eff0] tiny-msg anchor)
- *       "ar_efficiency": [[MiB, eff], ...], // size-binned AR efficiencies (including [0, eff0] tiny-msg anchor)
- *       "size": <2|4|8>,                     // run size (participating GPUs)
- *       "latency": <seconds>,                // small one-way P2P latency (4 KiB), seconds
- *       "ops": { "p2p":[1.0,null], "reduce_scatter":[1.0,-1], "all_gather":[1.0,-1], "all_reduce":[2.0,-1] },
- *       "must_be_filled": <bool>,            // hint for model builders
- *       "processor_usage": <0.03|0.04|0.05>  // light heuristic per size
- *     },
- *     ...
- *   ]
- * }
- *
- * Theory bandwidth (normalization)
- * --------------------------------
- * The “bandwidth” field is a single-link theory GB/s used to normalize efficiencies:
- *   1) If P2P_THEORY_GBPS > 0 → use it.
- *   2) Else if PCIE_GEN & PCIE_WIDTH set → per-lane payload GB/s × width.
- *   3) Else if NVLINK_GBPS & NVLINK_LINKS set → product.
- *   4) Else infer a conservative bin from an 8 MiB unidirectional plateau copy.
- *
- * Efficiency binning vs message size
- * ----------------------------------
- * • LLM payload sizes are a CSV list (MiB). For each size we measure:
- *     - PP: forward throughput across the boundary pair in a timed 1F1B loop.
- *     - AR: ring AllReduce “BusBW” (moved bytes per iter / time).
- * • Each efficiency entry is normalized by the “bandwidth” above.
- * • A tiny-message anchor [0, eff] is appended:
- *     - PP: from 4 KiB one-way cudaMemcpyPeer latency.
- *     - AR: from ~1 KiB AllReduce latency (ring model for moved bytes).
- *
- * Runs & topology
- * ---------------
- * • Runs attempt sizes 2, 4, and 8 when enough visible GPUs exist.
- * • Device sets and the boundary pair are configurable (see env below).
- * • CUDA P2P access is enabled across all pairs when possible.
- *
- * Progress & logging (matches gemm_bench.cu style)
- * ------------------------------------------------
- * • A single-line progress bar is printed to stderr:
- *     [########------------------------] 37.5% | PP  size=4  payload=32 MiB  (i/total)
- * • On completion, prints:  Wrote JSON: ./net_bw.json
- *
- * Key environment variables
- * -------------------------
- *  Device selection & boundary (per run size)
- *    SET2, SET4, SET8        Comma-separated device IDs forming the ordered set (default [0..N-1]).
- *    BOUND2, BOUND4, BOUND8  Two IDs “L,R” that must be adjacent in the set; this pair is the boundary.
- *                            Defaults: size=2 → "0,1"; size=4 → "1,2"; size=8 → "3,4".
- *
- *  Payloads & loop counts
- *    LLM_PAYLOAD_MB          CSV MiB list for PP/AR (default: 128,96,64,32,16,8,4,2,1).
- *    PP_WARMUP               Warm-up steps for PP 1F1B (default: 20).
- *    PP_STEPS                Timed PP steps (default: 400).
- *    AR_ITERS                Timed AllReduce iterations (default: 200).
- *
- *  Normalization / theory bandwidth
- *    P2P_THEORY_GBPS         Force the theory GB/s (overrides all inference).
- *    PCIE_GEN                3|4|5 (payload GB/s per lane ≈ 0.985/1.969/3.938).
- *    PCIE_WIDTH              PCIe lane count (e.g., 16).
- *    NVLINK_GBPS             Per-link payload GB/s (e.g., 50).
- *    NVLINK_LINKS            Number of NVLink links between boundary GPUs.
- *
- *  Output shaping
- *    MUST_FILL_POLICY        SINGLE|ALL|NONE (default SINGLE).
- *                            SINGLE → only the fastest theory BW (ties → smaller size) sets must_be_filled=true.
- *
- *  NCCL control (optional)
- *    PIN_NCCL=1              Pin Ring + Simple + 1 ring + CollNet off (deterministic A/B).
- *    NCCL_DEBUG=*            If you set NCCL_DEBUG yourself, your setting is respected.
- *
- * Build
- * -----
- *   With NCCL (recommended):
- *     nvcc -O3 -std=c++14 net_bw.cu -lnccl -o builds/net_bw
- *
- *   Without NCCL (PP uses cudaMemcpyPeer, AR skipped):
- *     nvcc -O3 -std=c++14 -DNO_NCCL net_bw.cu -o builds/net_bw
- *
- * Example runs
- * ------------
- *   # Megatron-like (auto NCCL), default payload grid
- *   ./builds/net_bw
- *
- *   # Pin deterministic NCCL selections for comparison
- *   PIN_NCCL=1 ./builds/net_bw
- *
- *   # Custom payloads (MiB)
- *   LLM_PAYLOAD_MB=128,64,32,16,8,4,2,1 ./builds/net_bw
- *
- * Notes & caveats
- * ---------------
- * • This focuses on single-node tiers (2/4/8) and steady-state traffic.
- * • Efficiencies are relative to the inferred/forced “theory” link GB/s.
- * • Real training may overlap compute/comm differently from this micro-bench.
- */
-
+// net_bw.cu — single-node network/comms micro-benchmark (CUDA + NCCL optional)
+//
+// What this program measures
+// --------------------------
+// Quickly characterizes “Megatron-like” communication on a single node across 2/4/8 GPUs:
+//   • PP (pipeline-parallel) steady-state 1F1B traffic between adjacent ranks
+//     using ncclSend/ncclRecv (or cudaMemcpyPeer when built with NO_NCCL).
+//   • AR (data/tensor-parallel) NCCL AllReduce (ring) bus bandwidth.
+//   • A small-message one-way P2P latency via 4 KiB cudaMemcpyPeer.
+//
+// Megatron-LM alignment
+// ---------------------
+// • By default, lets NCCL auto-select algorithm/protocol/rings — mirroring Megatron-LM.
+// • You can pin a deterministic config for A/B by setting: PIN_NCCL=1
+//   (Ring algo, Simple proto, 1 ring, CollNet disabled).
+// • Logging is quiet by default (NCCL_DEBUG=ERROR) unless you override it.
+//
+// Output (file)
+// -------------
+// Writes JSON to: ./net_bw.json
+//
+// Schema (abridged):
+// {
+//   "networks": [
+//     {
+//       "bandwidth": <theory_GBps>,         // single-link “theory” GB/s used for normalization
+//       "pp_efficiency": [[MiB, eff], ...], // size-binned PP efficiencies (including [0, eff0] tiny-msg anchor)
+//       "ar_efficiency": [[MiB, eff], ...], // size-binned AR efficiencies (including [0, eff0] tiny-msg anchor)
+//       "size": <2|4|8>,                     // run size (participating GPUs)
+//       "latency": <seconds>,                // small one-way P2P latency (4 KiB), seconds
+//       "ops": { "p2p":[1.0,null], "reduce_scatter":[1.0,-1], "all_gather":[1.0,-1], "all_reduce":[2.0,-1] },
+//       "must_be_filled": <bool>,            // hint for model builders
+//       "processor_usage": <0.03|0.04|0.05>  // light heuristic per size
+//     },
+//     ...
+//   ]
+// }
+//
+// Theory bandwidth (normalization)
+// --------------------------------
+// The “bandwidth” field is a single-link theory GB/s used to normalize efficiencies:
+//   1) If P2P_THEORY_GBPS > 0 → use it.
+//   2) Else if PCIE_GEN & PCIE_WIDTH set → per-lane payload GB/s × width.
+//   3) Else if NVLINK_GBPS & NVLINK_LINKS set → product.
+//   4) Else infer a conservative bin from an 8 MiB unidirectional plateau copy.
+//
+// Efficiency binning vs message size
+// ----------------------------------
+// • LLM payload sizes are a CSV list (MiB). For each size we measure:
+//     - PP: forward throughput across the boundary pair in a timed 1F1B loop.
+//     - AR: ring AllReduce “BusBW” (moved bytes per iter / time).
+// • Each efficiency entry is normalized by the “bandwidth” above.
+// • A tiny-message anchor [0, eff] is appended:
+//     - PP: from 4 KiB one-way cudaMemcpyPeer latency.
+//     - AR: from ~1 KiB AllReduce latency (ring model for moved bytes).
+//
+// Runs & topology
+// ---------------
+// • Runs attempt sizes 2, 4, and 8 when enough visible GPUs exist.
+// • Device sets and the boundary pair are configurable (see env below).
+// • CUDA P2P access is enabled across all pairs when possible.
+//
+// Progress & logging (matches gemm_bench.cu style)
+// ------------------------------------------------
+// • A single-line progress bar is printed to stderr:
+//     [########------------------------] 37.5% | PP  size=4  payload=32 MiB  (i/total)
+// • On completion, prints:  Wrote JSON: ./net_bw.json
+//
+// Key environment variables
+// -------------------------
+//  Device selection & boundary (per run size)
+//    SET2, SET4, SET8        Comma-separated device IDs forming the ordered set (default [0..N-1]).
+//    BOUND2, BOUND4, BOUND8  Two IDs “L,R” that must be adjacent in the set; this pair is the boundary.
+//                            Defaults: size=2 → "0,1"; size=4 → "1,2"; size=8 → "3,4".
+//
+//  Payloads & loop counts
+//    LLM_PAYLOAD_MB          CSV MiB list for PP/AR (default: 128,96,64,32,16,8,4,2,1).
+//    PP_WARMUP               Warm-up steps for PP 1F1B (default: 20).
+//    PP_STEPS                Timed PP steps (default: 400).
+//    AR_ITERS                Timed AllReduce iterations (default: 200).
+//
+//  Normalization / theory bandwidth
+//    P2P_THEORY_GBPS         Force the theory GB/s (overrides all inference).
+//    PCIE_GEN                3|4|5 (payload GB/s per lane ≈ 0.985/1.969/3.938).
+//    PCIE_WIDTH              PCIe lane count (e.g., 16).
+//    NVLINK_GBPS             Per-link payload GB/s (e.g., 50).
+//    NVLINK_LINKS            Number of NVLink links between boundary GPUs.
+//
+//  Output shaping
+//    MUST_FILL_POLICY        SINGLE|ALL|NONE (default SINGLE).
+//                            SINGLE → only the fastest theory BW (ties → smaller size) sets must_be_filled=true.
+//
+//  NCCL control (optional)
+//    PIN_NCCL=1              Pin Ring + Simple + 1 ring + CollNet off (deterministic A/B).
+//    NCCL_DEBUG=*            If you set NCCL_DEBUG yourself, your setting is respected.
+//
+//  Watchdog (anti-hang)
+//    STEP_TIMEOUT_MS         Per-step/iter bounded wait (default 10000 = 10 s).
+//    TINY_TIMEOUT_MS         Tiny AR latency op timeout (default 5000 = 5 s).
+//
+//  Contention knobs (defaults applied in main; currently not used by core loops)
+//    CONTEND_AR              Default 1
+//    CONTEND_PP              Default 1
+//
+// Build
+// -----
+//   With NCCL (recommended):
+//     nvcc -O3 -std=c++14 net_bw.cu -lnccl -o builds/net_bw
+//
+//   Without NCCL (PP uses cudaMemcpyPeer, AR skipped):
+//     nvcc -O3 -std=c++14 -DNO_NCCL net_bw.cu -o builds/net_bw
+//
+// Example runs
+// ------------
+//   ./builds/net_bw
+//   PIN_NCCL=1 ./builds/net_bw
+//   LLM_PAYLOAD_MB=128,64,32,16,8,4,2,1 ./builds/net_bw
+//
 
 #include <cuda_runtime.h>
 #include <cstdio>
@@ -135,16 +130,12 @@
 #include <thread>
 #include <atomic>
 #include <chrono>
-#include <ctime>
 #include <iostream>
 #include <fstream>
 #include <iomanip>
 
 #ifndef _WIN32
   #include <unistd.h>
-  #include <fcntl.h>
-  #include <sys/stat.h>
-  #include <sys/types.h>
 #else
   #include <process.h>
   #include <direct.h>
@@ -196,6 +187,32 @@ static inline double now_ms(){
   return std::chrono::duration<double, std::milli>(clk::now().time_since_epoch()).count();
 }
 static inline size_t MB(double x){ return (size_t)std::llround(x * 1024.0 * 1024.0); }
+
+#ifndef NO_NCCL
+// --- NCCL progress watchdog: fail fast on async error or lack of progress
+static inline void nccl_watch(ncclComm_t comm, double t0_ms, double budget_ms, const char* where){
+  ncclResult_t asyncErr = ncclSuccess;
+  ncclCommGetAsyncError(comm, &asyncErr);
+  if(asyncErr != ncclSuccess){
+    std::fprintf(stderr, "NCCL async error at %s: %s\n", where, ncclGetErrorString(asyncErr));
+    ncclCommAbort(comm);
+#ifdef _WIN32
+    std::exit(1);
+#else
+    _exit(1);
+#endif
+  }
+  if(now_ms() - t0_ms > budget_ms){
+    std::fprintf(stderr, "Timeout (%.0f ms) at %s — aborting communicator\n", budget_ms, where);
+    ncclCommAbort(comm);
+#ifdef _WIN32
+    std::exit(1);
+#else
+    _exit(1);
+#endif
+  }
+}
+#endif
 
 // ----- Progress bar (MATCHES gemm_bench.cu style) -----
 static void progress_with_cfg(double frac, const char* phase, int run_size, int payload_mib,
@@ -392,6 +409,7 @@ static void run_pp_1f1b_meas(const RunDef& rd, size_t bytes, int warmup_steps, i
     if(r == left){ ckCuda(cudaEventCreate(&e0),"pp e0"); ckCuda(cudaEventCreate(&e1),"pp e1"); }
 
     if(r == left) ckCuda(cudaEventRecord(e0, rr[r].stream), "pp rec e0");
+    const double STEP_TIMEOUT_MS = getenv_double("STEP_TIMEOUT_MS", 10000.0);
     for(int it=0; it<timed_steps; ++it){
       ckNccl(ncclGroupStart(), "pp grp start");
       if(r < W-1) ckNccl(ncclSend(rr[r].fwd_send, (ssize_t)rr[r].elems, ncclFloat32, r+1, rr[r].comm, rr[r].stream), "pp fwd send");
@@ -399,6 +417,16 @@ static void run_pp_1f1b_meas(const RunDef& rd, size_t bytes, int warmup_steps, i
       if(r > 0   ) ckNccl(ncclSend(rr[r].bwd_send, (ssize_t)rr[r].elems, ncclFloat32, r-1, rr[r].comm, rr[r].stream), "pp bwd send");
       if(r < W-1) ckNccl(ncclRecv(rr[r].bwd_recv, (ssize_t)rr[r].elems, ncclFloat32, r+1, rr[r].comm, rr[r].stream), "pp bwd recv");
       ckNccl(ncclGroupEnd(), "pp grp end");
+
+      // Bounded progress wait per step; catches desyncs quickly.
+      double t0 = now_ms();
+      while(cudaStreamQuery(rr[r].stream) == cudaErrorNotReady){
+#ifndef NO_NCCL
+        nccl_watch(rr[r].comm, t0, STEP_TIMEOUT_MS, "PP step");
+#endif
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      }
+      ckCuda(cudaGetLastError(), "pp step query");
     }
     if(r == left) ckCuda(cudaEventRecord(e1, rr[r].stream), "pp rec e1");
 
@@ -515,8 +543,18 @@ static void run_ar_collective(const RunDef& rd, size_t bytes, int iters,
 
     cudaEvent_t e0,e1; ckCuda(cudaEventCreate(&e0),"ar e0"); ckCuda(cudaEventCreate(&e1),"ar e1");
     ckCuda(cudaEventRecord(e0, rr[r].stream),"ar rec0");
+    const double STEP_TIMEOUT_MS = getenv_double("STEP_TIMEOUT_MS", 10000.0);
     for(int it=0; it<iters; ++it){
       ckNccl(ncclAllReduce(rr[r].buf, rr[r].buf, rr[r].elems, ncclFloat32, ncclSum, rr[r].comm, rr[r].stream), "ar iter");
+      // Ensure forward progress each iteration.
+      double t0 = now_ms();
+      while(cudaStreamQuery(rr[r].stream) == cudaErrorNotReady){
+#ifndef NO_NCCL
+        nccl_watch(rr[r].comm, t0, STEP_TIMEOUT_MS, "AR iter");
+#endif
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      }
+      ckCuda(cudaGetLastError(), "ar iter query");
     }
     ckCuda(cudaEventRecord(e1, rr[r].stream),"ar rec1");
     ckCuda(cudaEventSynchronize(e1),"ar sync e1");
@@ -528,6 +566,17 @@ static void run_ar_collective(const RunDef& rd, size_t bytes, int iters,
     cudaEvent_t l0,l1; ckCuda(cudaEventCreate(&l0),"l0"); ckCuda(cudaEventCreate(&l1),"l1");
     ckCuda(cudaEventRecord(l0, rr[r].stream),"l0rec");
     ckNccl(ncclAllReduce(rr[r].buf, rr[r].buf, small_elems, ncclFloat32, ncclSum, rr[r].comm, rr[r].stream), "lat ar");
+    {
+      const double TINY_TIMEOUT_MS = getenv_double("TINY_TIMEOUT_MS", 5000.0);
+      double t0 = now_ms();
+      while(cudaStreamQuery(rr[r].stream) == cudaErrorNotReady){
+#ifndef NO_NCCL
+        nccl_watch(rr[r].comm, t0, TINY_TIMEOUT_MS, "AR tiny-lat");
+#endif
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      }
+      ckCuda(cudaGetLastError(), "lat query");
+    }
     ckCuda(cudaEventRecord(l1, rr[r].stream),"l1rec");
     ckCuda(cudaEventSynchronize(l1),"lat sync");
     float lms=0.f; ckCuda(cudaEventElapsedTime(&lms,l0,l1),"lat el");
@@ -568,39 +617,6 @@ static void set_env_if_empty(const char* k, const char* v){
 #endif
 }
 
-static bool ensure_dir(const std::string& path){
-#ifdef _WIN32
-  if(_mkdir(path.c_str()) == 0) return true;
-  if(errno == EEXIST) return true;
-  return false;
-#else
-  if(mkdir(path.c_str(), 0755) == 0) return true;
-  if(errno == EEXIST) return true;
-  return false;
-#endif
-}
-
-static std::string timestamp_yyyyMMdd_HHmmss(){
-  std::time_t t = std::time(nullptr);
-  std::tm tm{};
-#ifdef _WIN32
-  localtime_s(&tm, &t);
-#else
-  localtime_r(&t, &tm);
-#endif
-  char buf[32];
-  std::strftime(buf, sizeof(buf), "%Y%m%d-%H%M%S", &tm);
-  return std::string(buf);
-}
-
-static long get_pid(){
-#ifdef _WIN32
-  return (long)_getpid();
-#else
-  return (long)getpid();
-#endif
-}
-
 // ----------------------------- Main -----------------------------
 int main(){
   // Quiet logging unless user explicitly set NCCL_DEBUG*
@@ -628,6 +644,10 @@ int main(){
     setenv("NCCL_COLLNET_ENABLE", "0", 1);
 #endif
   }
+
+  // Apply default contention knobs so users see explicit values in env if unset.
+  set_env_if_empty("CONTEND_AR", "1");
+  set_env_if_empty("CONTEND_PP", "1");
 
   int ndev=0; ckCuda(cudaGetDeviceCount(&ndev), "getDeviceCount");
   if(ndev < 2){ std::printf("{\"networks\": []}\n"); return 0; }

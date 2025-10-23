@@ -403,10 +403,11 @@ class Linear(Layer):
     m, n, k = seq_len, c_in, c_out
     super().__init__(name,
                      sys,
-                     m=m,
+                     m=micro_bs*m,  # Megatron‑LM flattens batch × sequence and uses a single 2‑D GEMM:
+                                    # m = micro_bs * seq_len, batch = 1 (addmm / matmul on [B*S, H] × [H, K]).
                      n=n,
                      k=k,
-                     batch=micro_bs,
+                     batch=1,
                      fw_flops=micro_bs*2*m*n*k,
                      agrad_flops=micro_bs*2*m*n*k,
                      wgrad_flops=micro_bs*2*m*n*k,
@@ -546,10 +547,11 @@ class LinearOverlapped(Layer):
 
     super().__init__(name,
                      sys,
-                     m=m,
+                     m=micro_bs*m,  # Megatron‑LM flattens batch × sequence and uses a single 2‑D GEMM:
+                                    # m = micro_bs * seq_len, batch = 1 (addmm / matmul on [B*S, H] × [H, K]).
                      n=n,
                      k=k,
-                     batch=micro_bs,
+                     batch=1,
                      fw_flops=micro_bs*2*m*n*k,
                      agrad_flops=micro_bs*2*m*n*k,
                      wgrad_flops=micro_bs*2*m*n*k,

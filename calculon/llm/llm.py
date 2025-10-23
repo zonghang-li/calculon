@@ -1760,15 +1760,17 @@ class Llm:
     #   read X + W, write Y
     fw_reads = (B * S * H + H * V_shard) * e
     fw_writes = (B * S * V_shard) * e
+    # Megatron‑LM flattens batch × sequence and uses a single 2‑D GEMM:
+    # m = micro_bs * seq_len, batch = 1 (addmm / matmul on [B*S, H] × [H, K]).
     self._lm_head_fw_comp_time_per_micro = _gemm_processing_time(
-      batch=B, m=S, n=V_shard, k=H, read_bytes=fw_reads, write_bytes=fw_writes
+      batch=1, m=B*S, n=V_shard, k=H, read_bytes=fw_reads, write_bytes=fw_writes
     )
     # Backward:
     # 1) dX GEMM: [B*S, V_shard] x [V_shard, H] -> [B*S, H]
     bx_reads = (B * S * V_shard + H * V_shard) * e
     bx_writes = (B * S * H) * e
     t_dx = _gemm_processing_time(
-      batch=B, m=S, n=H, k=V_shard, read_bytes=bx_reads, write_bytes=bx_writes
+      batch=1, m=B*S, n=H, k=V_shard, read_bytes=bx_reads, write_bytes=bx_writes
     )
     # 2) dW GEMM (always executed; when tied, this contributes to the shared embedding weight):
     #    [H, B*S] x [B*S, V_shard] -> [H, V_shard]
