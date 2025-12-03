@@ -2376,7 +2376,7 @@ class Llm:
     assert self._optim_mem_time >= self._block_optim_mem_time
     assert self._optim_time >= self._block_optim_time
     assert self._weight_space >= self._block_weight_space
-    assert self._act_space >= self._block_act_working_space
+    assert self._act_space >= self._block_act_working_peak
     assert self._act_checkpoint_size >= self._block_act_checkpoint_size
     assert self._weight_grad_space >= self._block_weight_grad_space_no_sharding
     assert self._act_grad_space == self._block_act_grad_space
