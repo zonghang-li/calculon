@@ -1,128 +1,87 @@
 #!/usr/bin/env bash
 # -----------------------------------------------------------------------------
-# main.sh — CUDA micro-bench orchestration & system.json generator
+# main.sh — CUDA micro-bench orchestration & system.json generator (NVIDIA)
 #
 # WHAT THIS SCRIPT DOES
 # ---------------------
-# Orchestrates build + execution of 5 CUDA micro-benchmarks and aggregates their
-# results into a single machine-readable file: ./system.json. It also preserves
-# prior GEMM benchmark results (./gemm_bench.json) and provides clean, stepwise
-# logging plus per-tool logs in ./builds/logs/.
+# Orchestrates build + execution of 5 CUDA micro-benchmarks and aggregates
+# their results into a single machine-readable file: ./system.json. It preserves
+# prior results when available and logs every step to ./builds/logs/.
 #
 # Included tools (auto-built from *.cu in this directory):
-#   - gemm_bench.cu   : FP32 GEMM sweep with micro-batch dimension; prints
-#                       progress (stderr) and writes a JSON summary file:
-#                       gemm_bench.json (no ASCII tables)
-#   - eltwise_fma.cu  : Vector FMA throughput; prints TFLOPS & efficiency table
-#   - gpu_info.cu     : Basic GPU/device info (name, CC, FP32 peak, mem theo)
-#   - mem_bw.cu       : Device & host memory bandwidths (mem1/mem2)
-#   - net_bw.cu       : NCCL collectives + P2P bandwidth/latency (optional)
+#   - gemm_bench.cu  : FP32 GEMM sweep (micro-batch aware). Writes JSON:
+#                      ./gemm_bench.json. Progress to stderr.
+#   - eltwise_fma.cu : Vector FMA throughput; prints TFLOPS & efficiency table.
+#   - gpu_info.cu    : Basic GPU/device info (name, CC, FP32 peak, mem).
+#   - mem_bw.cu      : Device & host memory bandwidths (mem1/mem2).
+#   - net_bw.cu      : P2P & NCCL collectives; writes JSON: ./net_bw.json.
 #
-# MAIN FEATURES
-# -------------
-# • Safe, incremental builds: hashes each .cu; recompiles only on changes
-# • Auto-detects CUDA install & GPU compute capability for nvcc flags
-# • Consumes gemm_bench’s native JSON (no fragile text parsing)
-# • Live GEMM progress/log streaming while the benchmark runs
-# • Preserves any existing ./gemm_bench.json (never deletes/overwrites it);
-#   fresh GEMM runs execute in a temp dir and are parsed from there
-# • Forwards GEMM tuning env-knobs (FAST, DIM_STRIDE, MB_DIMS, etc.) to gemm_bench
-# • Robust parsers for eltwise/mem_bw/net_bw outputs
-# • Emits ./system.json; pretty-prints via jq when available (compact otherwise)
-# • Stores build/runtime logs in ./builds/logs for post-mortem debugging
+# KEY BEHAVIOR
+# ------------
+# • Incremental builds: each source is hashed; recompiles only when changed.
+# • Auto-detects CUDA install & SM arch (via nvcc/nvidia-smi).
+# • Reuse-first for JSONs:
+#     - GEMM: If ./gemm_bench.json exists and RERUN_GEMM_BENCH=0 (default),
+#       reuse it; otherwise run ./builds/gemm_bench in a temp dir and parse its
+#       fresh JSON.
+#     - NETWORKS (REQUIRED): If ./net_bw.json exists and is readable and
+#       RERUN_NET_BENCH=0 (default), reuse it; otherwise run ./builds/net_bw in
+#       a temp dir and parse its fresh JSON. The “networks” field is [] only if
+#       neither reuse nor a fresh run yields a valid JSON.
+# • Pretty-prints ./system.json via jq when available (compact otherwise).
+# • Stores build/runtime logs in ./builds/logs for post-mortem debugging.
 #
-# RUNTIME OPTIONS (set as environment variables)
-# ----------------------------------------------
+# RUNTIME OPTIONS (environment variables)
+# ---------------------------------------
 # General orchestration:
-#   FORCE_REBUILD=0|1
-#       Force recompilation of all .cu files when set to 1. Default: 0.
-#
-#   RERUN_GEMM_BENCH=true|false|0|1
-#       If false/0 AND ./gemm_bench.json exists, reuse it without re-running
-#       gemm_bench. If true/1, gemm_bench is executed in a temp dir (existing
-#       ./gemm_bench.json is kept intact). Default: false.
-#
-#   RERUN_NET_BENCH=true|false|0|1
-#       If false/0 AND ./net_bw.json exists, reuse it without re-running
-#       net_bw. If true/1, net_bw is executed in a temp dir (existing
-#       ./net_bw.json is kept intact). Default: false.
+#   FORCE_REBUILD=0|1        Force rebuild of all sources (default: 0).
+#   RERUN_GEMM_BENCH=0|1     0 (default) reuses ./gemm_bench.json if present.
+#   RERUN_NET_BENCH=0|1      0 (default) reuses ./net_bw.json if present;
+#                            1 forces a fresh net_bw run.
 #
 # GEMM grid & memory knobs (forwarded to gemm_bench.cu):
-#   FAST=0|1
-#       Coarsen the dimension grid (FAST=1 implies DIM_STRIDE=2 by default and,
-#       if MB_DIMS is unset, tests B in {1,2,4,8,16,32} only).
-#
+#   FAST=0|1                 Default here: 0.
 #   DIM_STRIDE=<int>
-#       Subsample factor for M/N/K candidate lists (e.g., 2 keeps every 2nd dim).
-#
 #   MB_DIM_STRIDE=<int>
-#       Subsample factor for MB_DIMS when provided (default: DIM_STRIDE).
-#
-#   MB_DIMS="b1,b2,..."
-#       Micro-batch sizes to sweep. If unset, defaults to
-#       {1,2,4,8,16,32,64,128} (FAST=1 -> {1,2,4,8,16}).
-#
+#   MB_DIMS="1,2,4,8,16,32,64,128"   (FAST=1 ⇒ {1,2,4,8,16})
 #   MEM_CAP_GB=<float>
-#       Per-shape memory cap for B*A/B/C combined (approx). If not set, auto-
-#       derived as ~80% of free device memory.
+#   REPS_AUTO_TARGET_MS=<float>      (typ. 35 ms if supported by the tool)
+#   COMMON_DIMS / M_DIMS / N_DIMS / K_DIMS
+#   TOPK_PRINT                        (kept for compatibility)
 #
-#   REPS_AUTO_TARGET_MS=<float>
-#       Target milliseconds for per-shape timing (auto-tunes repetitions).
-#       Default: 35 ms.
+# net_bw.cu knobs (consumed by the binary; not all are set by this script):
+#   DISPLAY_OUTPUT=0|1       You can set this when running net_bw directly.
 #
-#   COMMON_DIMS="a,b,c,..."
-#       Comma-separated dimension set used for M,N,K simultaneously.
-#
-#   M_DIMS / N_DIMS / K_DIMS="a,b,c,..."
-#       Per-axis overrides for candidate dims (win over COMMON_DIMS).
-#
-#   TOPK_PRINT=<int>
-#       Kept for compatibility; gemm_bench no longer prints ASCII tables.
+# NCCL BUILD CUSTOMIZATION (for net_bw.cu)
+# ----------------------------------------
+#   net_bw.cu header example:
+#     nvcc -O3 -std=c++14 net_bw.cu \
+#       -I/home/zonghang.li/.conda/envs/megatron-lm/lib/python3.12/site-packages/nvidia/nccl/include \
+#       -L/home/zonghang.li/.conda/envs/megatron-lm/lib/python3.12/site-packages/nvidia/nccl/lib \
+#       -lnccl \
+#       -o builds/net_bw
+#   This script prefers that embedded nvcc line. You can alternatively export:
+#     NCCL_HOME=/path/to/nccl         # then includes = $NCCL_HOME/include, libs = $NCCL_HOME/lib
+#     NCCL_INCLUDE_DIR=/path/to/inc   # override include path
+#     NCCL_LIB_DIR=/path/to/lib       # override lib path
 #
 # HOW TO RUN
 # ----------
-# Basic:
-#   ./main.sh
+#   ./main.sh                         # build if needed; reuse JSONs when present
+#   FORCE_REBUILD=1 ./main.sh         # force recompilation of all tools
+#   RERUN_GEMM_BENCH=1 ./main.sh      # ignore existing gemm_bench.json
+#   RERUN_NET_BENCH=1 ./main.sh       # ignore existing net_bw.json (required step)
+#   FAST=1 ./main.sh                  # thinner GEMM grid forwarded to gemm_bench
 #
-# Rebuild everything:
-#   FORCE_REBUILD=1 ./main.sh
-#
-# Don't reuse prior GEMM benchmarks (./gemm_bench.json):
-#   RERUN_GEMM_BENCH=1 ./main.sh
-#
-# Don't reuse prior network benchmarks (./net_bw.json):
-#   RERUN_NET_BENCH=1 ./main.sh
-#
-# Run GEMM faster with a thinned grid:
-#   FAST=1 ./main.sh
-#
-# Custom dims & memory cap:
-#   COMMON_DIMS="128,256,512,1024,2048,4096,8192" MEM_CAP_GB=16 ./main.sh
-#
-# WHAT IT OUTPUTS
-#
-# System configuration file:
-#    ./system.json
-#    {
-#      "processing_mode": "no_overlap",
-#      "matrix": {
-#        "float32": {
-#          "tflops": <number>,
-#          "gflops_efficiency": <gemm_bench_json_array>
-#        }
-#      },
-#      "vector": {
-#        "float32": {
-#          "tflops": <number>,
-#          "gflops_efficiency": [[16,e],[4,e],[1,e],[0,e]]
-#        }
-#      },
-#      "mem1": { "GiB": <num>, "GBps": <num>, "MB_efficiency": [[MB,e],...] },
-#      "mem2": { "GiB": <num>, "GBps": <num>, "MB_efficiency": [[MB,e],...] },
-#      "networks": [ ... ]
-#    }
+# OUTPUTS
+# -------
+#   ./system.json                     # pretty if jq is installed; compact otherwise
+#   ./builds/logs/*.{build.log,out}   # per-tool build & runtime logs
+# -----------------------------------------------------------------------------
 
 set -euo pipefail
+set -E
+trap 'log_fail "Error on or near line $LINENO (exit $?)"; exit 1' ERR
 
 # --------------------------- UI / Logging helpers ----------------------------
 if [ -t 1 ]; then
@@ -142,25 +101,30 @@ log_fail()   { echo -e "    ${C_RED}✗${C_RST} $*"; }
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
+: "${CUDA_HOME:=}"
 BUILD_DIR="$SCRIPT_DIR/builds"
 LOG_DIR="$BUILD_DIR/logs"
 mkdir -p "$BUILD_DIR" "$LOG_DIR"
 
-# Sources:
+# Sources expected in this directory:
 SOURCES=(gemm_bench.cu eltwise_fma.cu gpu_info.cu mem_bw.cu net_bw.cu)
 
-FORCE_REBUILD=${FORCE_REBUILD:-0}            # set to 1 to force rebuilds
-RERUN_GEMM_BENCH=${RERUN_GEMM_BENCH:-false}  # default: false (do not re-run by default)
-RERUN_NET_BENCH=${RERUN_NET_BENCH:-false}    # default: false (do not re-run by default)
+FORCE_REBUILD=${FORCE_REBUILD:-0}
+RERUN_GEMM_BENCH=${RERUN_GEMM_BENCH:-0}   # default: reuse if JSON exists
+RERUN_NET_BENCH=${RERUN_NET_BENCH:-0}     # default: reuse if JSON exists
 
 # -------------------------- Env knobs (forwarding) ---------------------------
-# Added MB_DIMS and MB_DIM_STRIDE; kept TOPK_PRINT for compatibility.
+# Set FAST default to 0 explicitly and forward recognized keys.
+FAST="${FAST:-0}"
+export FAST
 GEMM_ENV_KEYS=(FAST DIM_STRIDE MB_DIM_STRIDE MEM_CAP_GB REPS_AUTO_TARGET_MS COMMON_DIMS M_DIMS N_DIMS K_DIMS MB_DIMS TOPK_PRINT)
 for k in "${GEMM_ENV_KEYS[@]}"; do
-  if [[ -n "${!k-}" ]]; then export "$k"; fi
+  if [[ -v $k ]]; then export "$k"; fi
 done
 
 # ------------------------------- Utilities ----------------------------------
+need() { command -v "$1" >/dev/null 2>&1 || { log_fail "Missing command: $1"; exit 2; }; }
+
 sha256_file() {
   if command -v sha256sum >/dev/null 2>&1; then
     sha256sum "$1" | awk '{print $1}'
@@ -171,22 +135,35 @@ sha256_file() {
   fi
 }
 
-detect_cuda() {
-  if ! command -v nvcc >/dev/null 2>&1; then
-    log_fail "nvcc not found on PATH. Please install CUDA Toolkit."; exit 2
+detect_cuda_home() {
+  if [[ -n "${CUDA_HOME:-}" ]]; then
+    echo "$CUDA_HOME"
+    return
   fi
-  CUDA_HOME="$(cd "$(dirname "$(dirname "$(command -v nvcc)")")" && pwd)"
-  echo "$CUDA_HOME"
+  if command -v nvcc >/dev/null 2>&1; then
+    local nv; nv="$(command -v nvcc)"
+    local root; root="$(cd "$(dirname "$(dirname "$nv")")" && pwd)"
+    echo "$root"
+    return
+  fi
+  echo "/usr/local/cuda"
 }
 
-detect_cc() {
-  if command -v nvidia-smi >/dev/null 2>&1; then
-    local line
-    line="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | sed -n '1p' || true)"
-    line="${line//./}"
-    if [[ -n "${line:-}" ]]; then echo "$line"; return; fi
+detect_sm_arch() {
+  # Respect explicit SM if provided
+  if [[ -n "${CUDA_SM_ARCH:-}" ]]; then
+    echo "sm_${CUDA_SM_ARCH}"
+    return
   fi
-  echo "70"  # safe default
+  if command -v nvidia-smi >/dev/null 2>&1; then
+    local cc
+    cc="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -n1 | tr -d '.' || true)"
+    if [[ -n "$cc" ]]; then
+      echo "sm_${cc}"
+      return
+    fi
+  fi
+  echo "sm_80"  # sensible default for A100-like
 }
 
 extract_build_cmd_from_header() {
@@ -200,27 +177,64 @@ extract_build_cmd_from_header() {
 }
 
 compose_nvcc_cmd() {
-  local src="$1" out="$2" cc="$3" cuda_home="$4"
+  local src="$1" out="$2" cuda_home="$3" sm_arch="$4"
   local libs=""
-  grep -Eq '#include[[:space:]]*<cublas' "$src" && libs="$libs -lcublas"
-  grep -Eq '#include[[:space:]]*<nccl\.h>' "$src" && libs="$libs -lnccl"
-  echo "nvcc -O3 -std=c++17 -I\"$cuda_home/include\" -L\"$cuda_home/lib64\" -gencode arch=compute_${cc},code=sm_${cc} \"$src\" -o \"$out\" $libs"
+  # Link cuBLAS if used
+  grep -Eq '#include[[:space:]]*<cublas_v2\.h>' "$src" && libs="$libs -lcublas"
+  # Link NCCL if used
+  if grep -Eq '#include[[:space:]]*<nccl\.h>' "$src"; then
+    local nccl_inc="" nccl_lib=""
+    if [[ -n "${NCCL_INCLUDE_DIR:-}" ]]; then
+      nccl_inc="$NCCL_INCLUDE_DIR"
+    elif [[ -n "${NCCL_HOME:-}" ]]; then
+      nccl_inc="$NCCL_HOME/include"
+    fi
+    if [[ -n "${NCCL_LIB_DIR:-}" ]]; then
+      nccl_lib="$NCCL_LIB_DIR"
+    elif [[ -n "${NCCL_HOME:-}" ]]; then
+      nccl_lib="$NCCL_HOME/lib"
+    fi
+    [[ -n "$nccl_inc" ]] && libs="$libs -I\"$nccl_inc\""
+    [[ -n "$nccl_lib" ]] && libs="$libs -L\"$nccl_lib\""
+    libs="$libs -lnccl"
+  fi
+  echo "nvcc -O3 -std=c++14 -arch=${sm_arch} -I\"$cuda_home/include\" -L\"$cuda_home/lib64\" \"$src\" -o \"$out\" $libs"
 }
 
 normalize_nvcc_cmd() {
-  local raw="$1" src="$2" out="$3" cc="$4" cuda_home="$5"
+  local raw="$1" src="$2" out="$3" cuda_home="$4" sm_arch="$5"
   local cmd="$raw"
+
+  # Make sure the source file path is exactly our src
   cmd="$(echo "$cmd" | sed -E "s@(^|[[:space:]])([[:alnum:]_./-]*${src##*/})([[:space:]]|$)@ \"$src\" @")"
+
+  # Ensure -o <out> is set to our binary
   if echo "$cmd" | grep -qE -- '(^|[[:space:]])-o[[:space:]]'; then
     cmd="$(echo "$cmd" | sed -E "s@-o[[:space:]]+[^[:space:]]+@-o \"$out\"@")"
   else
     cmd="$cmd -o \"$out\""
   fi
-  echo "$cmd" | grep -q -- "-I$cuda_home/include" || cmd="$cmd -I\"$cuda_home/include\""
-  echo "$cmd" | grep -q -- "-L$cuda_home/lib64"   || cmd="$cmd -L\"$cuda_home/lib64\""
-  if ! echo "$cmd" | grep -q -- '-gencode' && ! echo "$cmd" | grep -q -- '-arch'; then
-    cmd="$cmd -gencode arch=compute_${cc},code=sm_${cc}"
+
+  # Ensure an -arch flag exists
+  if ! echo "$cmd" | grep -q -- "-arch="; then
+    cmd="$cmd -arch=${sm_arch}"
   fi
+  # Ensure std + opt levels
+  echo "$cmd" | grep -q -- "-std="      || cmd="$cmd -std=c++14"
+  echo "$cmd" | grep -q -- "-O[0-3s]"   || cmd="$cmd -O3"
+
+  # Ensure CUDA include/lib paths
+  echo "$cmd" | grep -q -- "-I${cuda_home}/include"  || cmd="$cmd -I\"$cuda_home/include\""
+  echo "$cmd" | grep -q -- "-L${cuda_home}/lib64"    || cmd="$cmd -L\"$cuda_home/lib64\""
+
+  # Ensure cuBLAS/NCCL are linked if their headers are present
+  if grep -Eq '#include[[:space:]]*<cublas_v2\.h>' "$src"; then
+    echo "$cmd" | grep -q -- "-lcublas" || cmd="$cmd -lcublas"
+  fi
+  if grep -Eq '#include[[:space:]]*<nccl\.h>' "$src"; then
+    echo "$cmd" | grep -q -- "-lnccl"   || cmd="$cmd -lnccl"
+  fi
+
   echo "$cmd"
 }
 
@@ -234,22 +248,28 @@ build_one() {
   local hashfile="$BUILD_DIR/$stem.sha256"
   local bldlog="$LOG_DIR/$stem.build.log"
 
-  local need=0
-  if [[ $FORCE_REBUILD -eq 1 || ! -x "$bin" || ! -f "$hashfile" || "$(cat "$hashfile")" != "$hashnew" ]]; then need=1; fi
-  if [[ $need -eq 0 ]]; then log_ok "Up to date: $src → $bin"; return 0; fi
+  local needb=0
+  if [[ $FORCE_REBUILD -eq 1 || ! -x "$bin" || ! -f "$hashfile" || "$(cat "$hashfile")" != "$hashnew" ]]; then needb=1; fi
+  if [[ $needb -eq 0 ]]; then log_ok "Up to date: $src → $bin"; return 0; fi
 
   log_info "Compiling $src → $bin"
-  local cuda_home cc nvcc_cmd raw
-  cuda_home="$(detect_cuda)"; cc="$(detect_cc)"
+  need nvcc
+  local cuda_home sm_arch raw nvcc_cmd
+  cuda_home="$(detect_cuda_home)"
+  sm_arch="$(detect_sm_arch)"
+
   raw="$(extract_build_cmd_from_header "$src" || true)"
-  if [[ -n "$raw" ]]; then nvcc_cmd="$(normalize_nvcc_cmd "$raw" "$src" "$bin" "$cc" "$cuda_home")"
-  else nvcc_cmd="$(compose_nvcc_cmd "$src" "$bin" "$cc" "$cuda_home")"; fi
+  if [[ -n "$raw" ]]; then
+    nvcc_cmd="$(normalize_nvcc_cmd "$raw" "$src" "$bin" "$cuda_home" "$sm_arch")"
+  else
+    nvcc_cmd="$(compose_nvcc_cmd "$src" "$bin" "$cuda_home" "$sm_arch")"
+  fi
 
   log_info "nvcc cmd: ${C_DIM}$nvcc_cmd${C_RST}"
   set +e; eval "$nvcc_cmd" >"$bldlog" 2>&1; rc=${PIPESTATUS[0]:-0}; set -e
   if [[ $rc -ne 0 ]]; then
     log_fail "Build failed for $src (see $bldlog)"
-    [[ "$stem" == "net_bw" ]] && { log_warn "NCCL missing? Skipping net bench."; return 0; }
+    [[ "$stem" == "net_bw" ]] && { log_warn "NCCL missing or misconfigured? Skipping net bench."; return 0; }
     exit 3
   fi
   echo "$hashnew" >"$hashfile"
@@ -283,48 +303,147 @@ parse_mem_bw() {
   MEM2_MB_EFF="[$a2]"
 }
 
-# -------- FIXED: robustly capture the full [[...]] vector; never drop it -----
+# FIXED VERSION: no stray indentation inside the Python -c string
 parse_eltwise() {
   local txt="$1"
 
-  VEC_TFLOPS="$(printf '%s\n' "$txt" \
-    | awk -F= '/^[[:space:]]*tflops=/{gsub(/[ \t\r]/,"",$2); print $2; exit}')"
-  [[ -z "${VEC_TFLOPS:-}" ]] && VEC_TFLOPS="0"
-
-  local first
-  first="$(printf '%s\n' "$txt" \
-    | awk -F= '/^[[:space:]]*gflops_efficiency=/{print substr($0,index($0,"=")+1); exit}')"
-
-  if [[ -n "${first:-}" && "$first" != *"]]"* ]]; then
-    local rest
-    rest="$(printf '%s\n' "$txt" | awk '
-      /^[[:space:]]*gflops_efficiency=/ {grab=1; next}
-      grab && !done {print; if ($0 ~ /\]\]/) {done=1; exit}}
-    ')"
-    first="${first}${rest}"
+  # Prefer Python for robust parsing (handles multiline efficiency arrays)
+  if command -v python3 >/dev/null 2>&1; then
+    VEC_ALL="$(
+python3 -c 'import json,sys,re
+s = sys.stdin.read()
+out = {}
+for dt in ("float32","float16","float8"):
+    m = re.search(r"Vector table \(%s\):.*?tflops\s*=\s*([0-9.+-Ee]+).*?gflops_efficiency\s*=\s*(\[\[.*?\]\])" % dt, s, re.S)
+    if m:
+        try:
+            tf = float(m.group(1))
+        except Exception:
+            tf = 0.0
+        try:
+            eff = json.loads(m.group(2))
+        except Exception:
+            eff = []
+        out[dt] = {"tflops": tf, "gflops_efficiency": eff}
+print(json.dumps(out, separators=(",",":")))' <<<"$txt"
+    )"
+  else
+    # Fallback: awk (single-quoted program so Bash does not expand $1/$2)
+    VEC_ALL="$(
+      awk '
+        function flush() {
+          if (dtype != "") {
+            t=(tflops=="" ? "0" : tflops)
+            e=(eff=="" ? "[]" : eff)
+            if (printed>0) printf(",")
+            printf("\"%s\":{\"tflops\":%s,\"gflops_efficiency\":%s}", dtype, t, e)
+            printed++
+          }
+          dtype=""; tflops=""; eff=""; grab=0
+        }
+        BEGIN { printed=0; dtype=""; tflops=""; eff=""; grab=0 }
+        /Vector table \(float(32|16|8)\):/ {
+          match($0,/Vector table \(float(32|16|8)\):/,m)
+          flush(); dtype="float" m[1]; next
+        }
+        /tflops[[:space:]]*=/ {
+          line=$0; sub(/.*=/,"",line); gsub(/[ \t\r]/,"",line); tflops=line; next
+        }
+        /gflops_efficiency[[:space:]]*=/ {
+          grab=1; part=$0; sub(/.*=/,"",part); gsub(/\r/,"",part); eff=part
+          if (index(part,"]]")==0) next; else { grab=0; next }
+        }
+        grab { eff=eff $0; if (index($0,"]]")) grab=0; next }
+        END { flush() }
+      ' <<<"$txt"
+    )"
+    VEC_ALL="{${VEC_ALL}}"
   fi
 
-  first="$(printf '%s' "$first" | tr -d '\r' | sed -E 's/^(.*\]\]).*$/\1/')"
-  if [[ -n "${first:-}" && "$first" != *"]]" ]]; then
-    first="${first}]]"
+  # Ensure object shape even if nothing matched
+  [[ -n "${VEC_ALL//[[:space:]]/}" ]] || VEC_ALL="{}"
+
+  # Convenience vars used elsewhere (keep old names working)
+  if command -v jq >/dev/null 2>&1; then
+    VEC_TFLOPS="$(printf '%s' "$VEC_ALL" | jq -r '.float32.tflops // 0' 2>/dev/null || echo 0)"
+    VEC_EFF="$(printf '%s' "$VEC_ALL" | jq -c '.float32.gflops_efficiency // []' 2>/dev/null || echo '[]')"
+    VEC_TFLOPS_F16="$(printf '%s' "$VEC_ALL" | jq -r '.float16.tflops // 0' 2>/dev/null || echo 0)"
+    VEC_EFF_F16="$(printf '%s' "$VEC_ALL" | jq -c '.float16.gflops_efficiency // []' 2>/dev/null || echo '[]')"
+    VEC_TFLOPS_F8="$(printf '%s' "$VEC_ALL" | jq -r '.float8.tflops // 0' 2>/dev/null || echo 0)"
+    VEC_EFF_F8="$(printf '%s' "$VEC_ALL" | jq -c '.float8.gflops_efficiency // []' 2>/dev/null || echo '[]')"
+  else
+    # Minimal sed fallback for fp32 only
+    VEC_TFLOPS="$(printf '%s\n' "$txt" \
+      | sed -n '/Vector table (float32):/,$p' \
+      | sed -n 's/.*tflops[[:space:]]*=[[:space:]]*\([0-9.eE+-]\+\).*/\1/p' \
+      | head -n1)"
+    [[ -n "${VEC_TFLOPS:-}" ]] || VEC_TFLOPS=0
+    VEC_EFF="$(printf '%s\n' "$txt" \
+      | sed -n '/Vector table (float32):/,$p' \
+      | sed -n 's/.*gflops_efficiency[[:space:]]*=[[:space:]]*\(\[\[.*\]\]\).*/\1/p' \
+      | head -n1)"
+    [[ -n "${VEC_EFF:-}" ]] || VEC_EFF="[]"
   fi
-  VEC_EFF="$first"
+
+  return 0
 }
 
 parse_gemm_json() {
   local json_path="$1"
   if [[ -f "$json_path" ]]; then
     if command -v jq >/dev/null 2>&1; then
-      MAT_TFLOPS="$(jq -r '.float32.tflops // 0' "$json_path" 2>/dev/null || echo 0)"
-      MAT_EFF="$(jq -c '.float32.gflops_efficiency // []' "$json_path" 2>/dev/null || echo '[]')"
+      MAT_TFLOPS="$(
+        jq -r '
+          .float32.tflops
+          // .fp32.tflops
+          // .matrix.float32.tflops
+          // .tflops
+          // 0
+        ' "$json_path" 2>/dev/null || echo 0
+      )"
+      MAT_EFF="$(
+        jq -c '
+          .float32.gflops_efficiency
+          // .fp32.gflops_efficiency
+          // .matrix.float32.gflops_efficiency
+          // .efficiency
+          // {}
+        ' "$json_path" 2>/dev/null || echo '{}'
+      )"
+      MAT_ALL="$(
+        jq -c '
+          def emit(k):
+            if .|has(k) then
+              { (k): { tflops: (.[k].tflops // 0),
+                       gflops_efficiency: (.[k].gflops_efficiency // {}) } }
+            else {} end;
+          emit("float32") + emit("float16") + emit("float8")
+        ' "$json_path" 2>/dev/null || echo '{}'
+      )"
       return 0
     elif command -v python3 >/dev/null 2>&1; then
-      read -r MAT_TFLOPS MAT_EFF < <(python3 - "$json_path" <<'PY'
+      read -r MAT_TFLOPS MAT_EFF MAT_ALL < <(python3 - "$json_path" <<'PY'
 import json,sys
 d=json.load(open(sys.argv[1]))
-tf=d.get("float32",{}).get("tflops",0)
-eff=d.get("float32",{}).get("gflops_efficiency",[])
-print(tf, json.dumps(eff,separators=(",",":")))
+def pick(*paths, default=None):
+    for p in paths:
+        cur=d
+        ok=True
+        for k in p.split('.'):
+            if isinstance(cur, dict) and k in cur: cur=cur[k]
+            else:
+                ok=False; break
+        if ok: return cur
+    return default
+tf = pick('float32.tflops','fp32.tflops','matrix.float32.tflops','tflops', default=0)
+eff = pick('float32.gflops_efficiency','fp32.gflops_efficiency','matrix.float32.gflops_efficiency','efficiency', default={})
+out={}
+for k in ('float32','float16','float8'):
+    if isinstance(d,dict) and k in d and isinstance(d[k],dict):
+        out[k]={'tflops': d[k].get('tflops',0),
+                'gflops_efficiency': d[k].get('gflops_efficiency',{})}
+import json as J
+print(tf, J.dumps(eff, separators=(",",":")), J.dumps(out, separators=(",",":")))
 PY
 )
       return 0
@@ -341,7 +460,7 @@ PY
 parse_net() {
   local txt="$1"
   if [[ -z "${txt:-}" ]]; then NET_ARR="[]"; return; fi
-  if command -v jq >/dev/null 21>&1; then
+  if command -v jq >/dev/null 2>&1; then
     NET_ARR="$(echo "$txt" | jq -c '.networks // []' 2>/dev/null || echo "[]")"
   elif command -v python3 >/dev/null 2>&1; then
     NET_ARR="$(python3 - <<'PY'
@@ -362,14 +481,29 @@ PY
   fi
 }
 
-# ----------------------------- 1) Toolchain check ----------------------------
+num_sanitize() { printf '%s' "${1:-0}" | tr -cd '0-9.+-'; }
+json_is_array() { [[ "${1:-}" =~ ^[[:space:]]*\[.*\][[:space:]]*$ ]]; }
+json_is_obj_or_arr() { [[ "${1:-}" =~ ^[[:space:]]*[\[\{].*[\]\}][[:space:]]*$ ]]; }
+
+# ----------------------------- 1) Environment check --------------------------
 log_step "Environment check"
-CUDA_HOME="$(detect_cuda)"
-log_ok "CUDA_HOME: $CUDA_HOME"
+need bash
+need awk
+need sed
+need tr
+need tee
+need sort
+need nvcc
+
+NVCC_BIN="$(command -v nvcc)"
+log_ok "nvcc: ${NVCC_BIN}"
+
+CUDA_HOME="$(detect_cuda_home)"
+log_ok "CUDA home: ${CUDA_HOME}"
 
 if command -v nvidia-smi >/dev/null 2>&1; then
-  NSUM="$(nvidia-smi --query-gpu=name,driver_version --format=csv,noheader 2>/dev/null | sed -n '1p' || true)"
-  log_ok "nvidia-smi: ${NSUM:-unknown}"
+  local_sum="$(nvidia-smi --query-gpu=name,driver_version --format=csv,noheader 2>/dev/null | head -n1 || true)"
+  [[ -n "$local_sum" ]] && log_ok "nvidia-smi: $(echo "$local_sum" | sed 's/[[:space:]]\+/ /g')"
 else
   log_warn "nvidia-smi not found; continuing without it"
 fi
@@ -396,9 +530,10 @@ if [[ -x "$BUILD_DIR/gpu_info" ]]; then
   set -e
   if [[ $rc -ne 0 ]]; then
     log_warn "gpu_info failed (rc=$rc)"
+  else
+    parse_gpu_info "$(cat "$LOG_DIR/gpu_info.out" 2>/dev/null || true)"
+    log_ok "GPU: ${GPU_NAME:-unknown}, CC=${GPU_CC:-?}, FP32 TFLOPS peak=${GPU_FP32_TFLOPS:-?}, MEM1 theo GB/s=${GPU_MEM1_GBPS_PEAK_THEO:-?}"
   fi
-  parse_gpu_info "$(cat "$LOG_DIR/gpu_info.out" 2>/dev/null || true)"
-  log_ok "GPU: ${GPU_NAME:-unknown}, CC=${GPU_CC:-?}, FP32 TFLOPS peak=${GPU_FP32_TFLOPS:-?}, MEM1 theo GB/s=${GPU_MEM1_GBPS_PEAK_THEO:-?}"
 else
   log_warn "gpu_info binary missing; proceeding without it"
 fi
@@ -424,140 +559,156 @@ fi
 if [[ -x "$BUILD_DIR/eltwise_fma" ]]; then
   log_step "Running eltwise_fma"
   set +e
-  "$BUILD_DIR/eltwise_fma" 2>&1 | tee "$LOG_DIR/eltwise_fma.out"
-  rc=${PIPESTATUS[0]:-0}
+  "$BUILD_DIR/eltwise_fma" >"$LOG_DIR/eltwise_fma.out" 2>&1
+  rc=$?
   set -e
+  if [[ "${VERBOSE:-0}" == "1" ]]; then cat "$LOG_DIR/eltwise_fma.out" || true; fi
+
   if [[ $rc -ne 0 ]]; then
-    log_warn "eltwise_fma failed (rc=$rc); vector section may be empty"
-    VEC_TFLOPS="${VEC_TFLOPS:-0}"; VEC_EFF="${VEC_EFF:-[]}"
-  else
-    parse_eltwise "$(cat "$LOG_DIR/eltwise_fma.out")"
-    log_ok "vector.fp32 tflops=${VEC_TFLOPS:-?}"
+    log_warn "eltwise_fma returned rc=$rc (continuing; parsing output anyway)"
   fi
+  parse_eltwise "$(cat "$LOG_DIR/eltwise_fma.out" 2>/dev/null || true)"
+  VEC_TFLOPS="${VEC_TFLOPS:-0}"
+  [[ -n "${VEC_EFF:-}" ]] || VEC_EFF="[]"
+  log_ok "vector.fp32 tflops=${VEC_TFLOPS}"
 else
   log_warn "eltwise_fma binary missing; vector section will be empty"
 fi
 
 # gemm_bench (matrix) — reuse JSON by default
 GEMM_JSON="$SCRIPT_DIR/gemm_bench.json"
-reuse=false
-case "${RERUN_GEMM_BENCH,,}" in
-  0|false|no|off) reuse=true ;;
+reuse_gemm=true
+case "$(printf '%s' "${RERUN_GEMM_BENCH:-0}" | tr '[:upper:]' '[:lower:]')" in
+  1|true|yes|on) reuse_gemm=false ;;
 esac
 
 if [[ -x "$BUILD_DIR/gemm_bench" ]]; then
-  if [[ "$reuse" == true && -f "$GEMM_JSON" ]]; then
-    log_step "Using existing gemm_bench.json (RERUN_GEMM_BENCH=false)"
+  if [[ "$reuse_gemm" == true && -f "$GEMM_JSON" ]]; then
+    log_step "Using existing gemm_bench.json (RERUN_GEMM_BENCH=0)"
     if parse_gemm_json "$GEMM_JSON"; then
       log_ok "matrix.fp32 tflops=${MAT_TFLOPS:-?} (from existing ./gemm_bench.json)"
     else
       log_warn "Existing gemm_bench.json unreadable; will run gemm_bench in a temp dir."
-      reuse=false
+      reuse_gemm=false
     fi
-  elif [[ "$reuse" == true && ! -f "$GEMM_JSON" ]]; then
+  elif [[ "$reuse_gemm" == true && ! -f "$GEMM_JSON" ]]; then
     log_warn "gemm_bench.json not found; will run gemm_bench in a temp dir."
-    reuse=false
+    reuse_gemm=false
   fi
 
-  if [[ "$reuse" == false ]]; then
+  if [[ "$reuse_gemm" == false ]]; then
     log_step "Running gemm_bench in a temp directory"
-    env_summary=(); for k in "${GEMM_ENV_KEYS[@]}"; do [[ -n "${!k-}" ]] && env_summary+=("$k=${!k}"); done
-    [[ ${#env_summary[@]} -gt 0 ]] && log_info "GEMM env: ${env_summary[*]}"
+    env_summary=()
+    for k in "${GEMM_ENV_KEYS[@]}"; do
+      if [[ -v $k ]]; then env_summary+=("$k=${!k}"); fi
+    done
+    (( ${#env_summary[@]} > 0 )) && log_info "GEMM env: ${env_summary[*]}"
 
-    # Create a unique temp run dir and execute gemm_bench there
     RUN_DIR="$BUILD_DIR/gemm_run_$(date +%Y%m%d-%H%M%S)_$$"
     mkdir -p "$RUN_DIR"
 
     if command -v stdbuf >/dev/null 2>&1; then STDBUF="stdbuf -oL -eL"; else STDBUF=""; fi
 
     set +e
-    ( cd "$RUN_DIR" && $STDBUF "$BUILD_DIR/gemm_bench" ) 2>&1 | tee "$LOG_DIR/gemm_bench.out"
-    rc=${PIPESTATUS[0]:-0}
+    ( cd "$RUN_DIR" && $STDBUF "$BUILD_DIR/gemm_bench" ) >"$LOG_DIR/gemm_bench.out" 2>&1
+    rc=$?
     set -e
+    cat "$LOG_DIR/gemm_bench.out" || true
 
     if [[ $rc -ne 0 ]]; then
       log_warn "gemm_bench failed (rc=$rc); matrix section will be empty"
-      MAT_TFLOPS="${MAT_TFLOPS:-0}"; MAT_EFF="[]"
+      MAT_TFLOPS="${MAT_TFLOPS:-0}"; MAT_EFF="{}"
     else
-      # Parse the freshly produced JSON inside RUN_DIR (do NOT touch ./gemm_bench.json)
       if parse_gemm_json "$RUN_DIR/gemm_bench.json"; then
         log_ok "matrix.fp32 tflops=${MAT_TFLOPS:-?} (from $RUN_DIR/gemm_bench.json)"
+        cp -f "$RUN_DIR/gemm_bench.json" "$GEMM_JSON" 2>/dev/null || true
       else
         log_warn "Temp gemm_bench.json missing/unreadable; leaving matrix empty"
-        MAT_TFLOPS="${MAT_TFLOPS:-0}"; MAT_EFF="[]"
+        MAT_TFLOPS="${MAT_TFLOPS:-0}"; MAT_EFF="{}"
       fi
     fi
   fi
 else
   log_warn "gemm_bench binary missing; matrix section will be empty"
-  MAT_TFLOPS="${MAT_TFLOPS:-0}"; MAT_EFF="[]"
+  MAT_TFLOPS="${MAT_TFLOPS:-0}"; MAT_EFF="{}"
 fi
 
-# net_bw (optional) — reuse JSON by default
+# net_bw
 NET_JSON="$SCRIPT_DIR/net_bw.json"
-net_reuse=false
-case "${RERUN_NET_BENCH,,}" in
-  0|false|no|off) net_reuse=true ;;
+
+force_rerun=false
+case "$(printf '%s' "${RERUN_NET_BENCH:-0}" | tr '[:upper:]' '[:lower:]')" in
+  1|true|yes|on) force_rerun=true ;;
 esac
 
-if [[ -x "$BUILD_DIR/net_bw" ]]; then
-  if [[ "$net_reuse" == true && -f "$NET_JSON" ]]; then
-    log_step "Using existing net_bw.json (RERUN_NET_BENCH=false)"
-    if [[ -s "$NET_JSON" ]]; then
-      if command -v jq >/dev/null 2>&1; then
-        NET_ARR="$(jq -c '.networks // []' "$NET_JSON" 2>/dev/null || echo "[]")"
-      else
-        parse_net "$(cat "$NET_JSON" 2>/dev/null || true)"
-      fi
-      log_ok "networks parsed (from existing ./net_bw.json)"
-    else
-      log_warn "Existing net_bw.json is empty; will run net_bw in a temp dir."
-      net_reuse=false
-    fi
-  elif [[ "$net_reuse" == true && ! -f "$NET_JSON" ]]; then
-    log_warn "net_bw.json not found; will run net_bw in a temp dir."
-    net_reuse=false
+parse_networks_json() {
+  local path="$1"
+  if [[ ! -r "$path" ]]; then
+    log_warn "Cannot read $path (permissions/ACL?); will rerun net_bw."
+    return 1
   fi
+  if command -v jq >/dev/null 2>&1; then
+    NET_ARR="$(jq -c '.networks // []' "$path" 2>/dev/null)" || return 1
+  elif command -v python3 >/dev/null 2>&1; then
+    NET_ARR="$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(json.dumps(d.get(\"networks\",[]), separators=(\",\",\":\")))' "$path")" || return 1
+  else
+    one="$(tr -d '\n' < "$path" 2>/dev/null)" || return 1
+    NET_ARR="$(printf '%s' "$one" | sed -E 's/.*"networks"[[:space:]]*:[[:space:]]*(\[[[:print:]]*\]).*/\1/')" || true
+    [[ -z "${NET_ARR:-}" ]] && return 1
+  fi
+  return 0
+}
 
-  if [[ "$net_reuse" == false ]]; then
-    log_step "Running net_bw in a temp directory"
+need_run=true
+if [[ "$force_rerun" == false && -s "$NET_JSON" ]]; then
+  need_run=false
+fi
+
+if [[ "$need_run" == false ]]; then
+  log_step "Using existing net_bw.json (RERUN_NET_BENCH=0)"
+  if ! parse_networks_json "$NET_JSON"; then
+    log_warn "Existing net_bw.json unreadable; will rerun net_bw."
+    need_run=true
+  else
+    log_ok "networks parsed from ./net_bw.json"
+  fi
+fi
+
+if [[ "$need_run" == true ]]; then
+  if [[ ! -x "$BUILD_DIR/net_bw" ]]; then
+    log_fail "net_bw binary missing and no reusable ./net_bw.json; networks will be []."
+    NET_ARR="[]"
+  else
+    log_step "Running net_bw"
     RUN_DIR="$BUILD_DIR/net_run_$(date +%Y%m%d-%H%M%S)_$$"
     mkdir -p "$RUN_DIR"
-
     if command -v stdbuf >/dev/null 2>&1; then STDBUF="stdbuf -oL -eL"; else STDBUF=""; fi
 
     set +e
-    ( cd "$RUN_DIR" && $STDBUF "$BUILD_DIR/net_bw" ) 2>&1 | tee "$LOG_DIR/net_bw.out"
-    rc=${PIPESTATUS[0]:-0}
+    ( cd "$RUN_DIR" && $STDBUF "$BUILD_DIR/net_bw" ) >"$LOG_DIR/net_bw.out" 2>&1
+    rc=$?
     set -e
+    cat "$LOG_DIR/net_bw.out" || true
 
     if [[ $rc -ne 0 ]]; then
-      log_warn "net_bw failed (rc=$rc); networks will be []"
+      log_fail "net_bw run failed (rc=$rc); networks will be []."
       NET_ARR="[]"
-    else
-      if [[ -f "$RUN_DIR/net_bw.json" ]]; then
-        if command -v jq >/dev/null 2>&1; then
-          NET_ARR="$(jq -c '.networks // []' "$RUN_DIR/net_bw.json" 2>/dev/null || echo "[]")"
-        else
-          parse_net "$(cat "$RUN_DIR/net_bw.json" 2>/dev/null || true)"
-        fi
-        log_ok "networks parsed (from $RUN_DIR/net_bw.json)"
+    elif [[ -f "$RUN_DIR/net_bw.json" ]]; then
+      if parse_networks_json "$RUN_DIR/net_bw.json"; then
+        log_ok "networks parsed from $RUN_DIR/net_bw.json"
+        cp -f "$RUN_DIR/net_bw.json" "$NET_JSON" 2>/dev/null || true
       else
-        log_warn "Expected $RUN_DIR/net_bw.json not found; networks will be []"
+        log_warn "Failed to parse $RUN_DIR/net_bw.json; networks will be []."
         NET_ARR="[]"
       fi
+    else
+      log_warn "Expected $RUN_DIR/net_bw.json not found; networks will be []."
+      NET_ARR="[]"
     fi
   fi
-else
-  NET_ARR="[]"
-  log_warn "net_bw binary missing; networks will be []"
 fi
 
 # --------------------------- 4) JSON defaults/validation ---------------------
-json_is_array() { [[ "${1:-}" =~ ^[[:space:]]*\[.*\][[:space:]]*$ ]]; }
-json_is_obj_or_arr() { [[ "${1:-}" =~ ^[[:space:]]*[\[\{].*[\]\}][[:space:]]*$ ]]; }
-num_sanitize() { printf '%s' "${1:-0}" | tr -cd '0-9.+-'; }
-
 MAT_TFLOPS="$(num_sanitize "${MAT_TFLOPS:-0}")"
 VEC_TFLOPS="$(num_sanitize "${VEC_TFLOPS:-0}")"
 MEM1_GiB="$(num_sanitize "${MEM1_GiB:-0}")"
@@ -570,6 +721,17 @@ json_is_array "${MEM1_MB_EFF:-}"  || MEM1_MB_EFF="[]"
 json_is_array "${MEM2_MB_EFF:-}"  || MEM2_MB_EFF="[]"
 json_is_array "${NET_ARR:-}"      || NET_ARR="[]"
 json_is_obj_or_arr "${MAT_EFF:-}" || MAT_EFF="{}"
+json_is_obj_or_arr "${MAT_ALL:-}" || MAT_ALL="{}"
+json_is_obj_or_arr "${VEC_ALL:-}" || VEC_ALL="{}"
+
+# Fallback if vector multi-dtype parsing was unavailable
+if [[ -z "${VEC_ALL}" || "${VEC_ALL}" == "{}" ]]; then
+  VEC_ALL="{\"float32\":{\"tflops\":${VEC_TFLOPS:-0},\"gflops_efficiency\":${VEC_EFF:-[]}}}"
+fi
+# Fallback if matrix multi-dtype was unavailable
+if [[ -z "${MAT_ALL}" || "${MAT_ALL}" == "{}" ]]; then
+  MAT_ALL="{\"float32\":{\"tflops\":${MAT_TFLOPS:-0},\"gflops_efficiency\":${MAT_EFF:-{}}}}"
+fi
 
 # ----------------------------- 5) Emit system.json ---------------------------
 log_step "Generating ./system.json"
@@ -578,18 +740,8 @@ TMP_JSON="$BUILD_DIR/system.json.tmp"
 cat > "$TMP_JSON" <<JSON
 {
   "processing_mode": "no_overlap",
-  "matrix": {
-    "float32": {
-      "tflops": ${MAT_TFLOPS},
-      "gflops_efficiency": ${MAT_EFF}
-    }
-  },
-  "vector": {
-    "float32": {
-      "tflops": ${VEC_TFLOPS},
-      "gflops_efficiency": ${VEC_EFF}
-    }
-  },
+  "matrix": ${MAT_ALL},
+  "vector": ${VEC_ALL},
   "mem1": {
     "GiB": ${MEM1_GiB},
     "GBps": ${MEM1_GBps},
@@ -623,4 +775,4 @@ log_step "Done"
 echo -e "   Inspect logs in ${C_DIM}$LOG_DIR${C_RST}"
 echo -e "   Re-run with ${C_DIM}FORCE_REBUILD=1${C_RST} to force recompilation"
 echo -e "   Example: ${C_DIM}FAST=1 ./main.sh${C_RST} to thin the GEMM grid"
-echo -e "   Reuse previous GEMM results with ${C_DIM}RERUN_GEMM_BENCH=false ./main.sh${C_RST}"
+echo -e "   Reuse previous results with ${C_DIM}RERUN_GEMM_BENCH=0 RERUN_NET_BENCH=0 ./main.sh${C_RST}"

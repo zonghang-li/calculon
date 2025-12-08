@@ -1,0 +1,821 @@
+{
+  "version": 1,
+  "start_time": "2025-12-05 22:01:23",
+  "args": [
+    "\/home\/zonghang.li\/calculon\/3rdparty\/nccl-tests\/build\/all_reduce_perf",
+    "-b",
+    "8",
+    "-e",
+    "2G",
+    "-f",
+    "2",
+    "-g",
+    "1",
+    "-J",
+    "..\/nccl_tests\/nccl_ar_perf.n2g1.json"
+  ],
+  "env": [
+    "SHELL=\/bin\/bash",
+    "PMI_SIZE=2",
+    "SLURM_STEP_NUM_TASKS=2",
+    "PMI_FD=11",
+    "SLURM_JOB_USER=zonghang.li",
+    "SLURM_TASKS_PER_NODE=1(x2)",
+    "SLURM_JOB_UID=2655",
+    "SLURM_STEP_GPUS=0",
+    "SLURM_CPU_BIND=quiet,mask_cpu:0x0000000000000000000000000000000100000000000000000000000000000001",
+    "SLURM_TASK_PID=4042027",
+    "CONDA_EXE=\/apps\/local\/anaconda3\/bin\/conda",
+    "_CE_M=",
+    "SLURM_JOB_GPUS=0",
+    "SLURM_LOCALID=0",
+    "SLURM_SUBMIT_DIR=\/home\/zonghang.li\/calculon\/scripts\/slurm\/nvidia\/sbatch",
+    "SLURM_CPU_BIND_VERBOSE=quiet",
+    "HISTSIZE=2000",
+    "HOSTNAME=gpu-07",
+    "SLURMD_NODENAME=gpu-07",
+    "__LMOD_REF_COUNT_CPPATH=\/apps\/local\/nvidia\/cuda-12.0\/include:1",
+    "SLURM_JOB_START_TIME=1764957681",
+    "HYDRA_LAUNCHER_EXTRA_ARGS=--external-launcher",
+    "_ModuleTable002_=IiwgIi9ldGMvcWx1c3Rhci9jb21tb24vbG1vZC9tb2R1bGVmaWxlcyIsICIvYXBwcy9sb2NhbC9sbW9kL21vZHVsZWZpbGVzIiwKfSwKc3lzdGVtQmFzZU1QQVRIID0gIi91c3Ivc2hhcmUvbG1vZC9sbW9kL21vZHVsZWZpbGVzOi9ldGMvcWx1c3Rhci9jb21tb24vbG1vZC9tb2R1bGVmaWxlczovYXBwcy9sb2NhbC9sbW9kL21vZHVsZWZpbGVzIiwKfQo=",
+    "SLURM_STEP_NODELIST=gpu-[07-08]",
+    "__LMOD_REF_COUNT_MODULEPATH=\/usr\/share\/lmod\/lmod\/modulefiles:1;\/etc\/qlustar\/common\/lmod\/modulefiles:1;\/apps\/local\/lmod\/modulefiles:1",
+    "__LMOD_REF_COUNT_CPLUS_INCLUDE_PATH=\/apps\/local\/nvidia\/cuda-12.0\/include:1",
+    "SLURM_CLUSTER_NAME=mbz-ciai",
+    "SLURM_JOB_END_TIME=1764957981",
+    "SLURM_CPUS_ON_NODE=2",
+    "CPPATH=\/apps\/local\/nvidia\/cuda-12.0\/include",
+    "SLURM_UMASK=0022",
+    "SLURM_JOB_CPUS_PER_NODE=1(x2)",
+    "LMOD_DIR=\/usr\/share\/lmod\/lmod\/libexec",
+    "NCCL_DEBUG_SUBSYS=INIT,NET",
+    "SLURM_GPUS_ON_NODE=1",
+    "PWD=\/home\/zonghang.li\/calculon\/scripts\/slurm\/nvidia\/sbatch",
+    "PRTE_MCA_plm_slurm_args=--external-launcher",
+    "SLURM_GTIDS=0",
+    "LOGNAME=zonghang.li",
+    "XDG_SESSION_TYPE=tty",
+    "CONDA_PREFIX=\/apps\/local\/anaconda3",
+    "SLURM_JOB_PARTITION=cscc-gpu-p",
+    "MODULESHOME=\/usr\/share\/lmod\/lmod",
+    "NCCL_HOME=\/home\/zonghang.li\/.conda\/envs\/megatron-lm\/lib\/python3.12\/site-packages\/nvidia\/nccl",
+    "MANPATH=\/usr\/share\/lmod\/lmod\/share\/man:\/usr\/share\/man",
+    "SLURM_TRES_PER_TASK=cpu:1",
+    "ROCR_VISIBLE_DEVICES=0",
+    "NCCL_DEBUG=INFO",
+    "SLURM_JOB_NUM_NODES=2",
+    "SRUN_DEBUG=3",
+    "SLURM_STEPID=0",
+    "SLURM_CPU_BIND_LIST=0x0000000000000000000000000000000100000000000000000000000000000001",
+    "SLURM_JOBID=165377",
+    "SLURM_LAUNCH_NODE_IPADDR=192.168.62.107",
+    "SLURM_JOB_QOS=cscc-gpu-qos",
+    "I_MPI_HYDRA_BOOTSTRAP_EXEC_EXTRA_ARGS=--external-launcher",
+    "MOTD_SHOWN=pam",
+    "__LMOD_REF_COUNT_PATH=\/apps\/local\/nvidia\/cuda-12.0\/bin:1;\/apps\/local\/anaconda3\/bin:1;\/usr\/bin:1;\/bin:1;\/usr\/sbin:1;\/sbin:1",
+    "HOME=\/home\/zonghang.li",
+    "_ModuleTable_Sz_=2",
+    "LANG=C",
+    "SLURM_CPU_BIND_TYPE=mask_cpu:",
+    "SLURMD_DEBUG=2",
+    "SLURM_PROCID=0",
+    "LMOD_SHELL_PRGM=bash",
+    "LMOD_SETTARG_FULL_SUPPORT=no",
+    "CONDA_PROMPT_MODIFIER=(base) ",
+    "TMPDIR=\/tmp\/slurm-zonghang.li-165377",
+    "SLURM_CPUS_PER_TASK=1",
+    "SLURM_NTASKS=2",
+    "SLURM_TOPOLOGY_ADDR=gpu-07",
+    "LMOD_VERSION=8.7.12",
+    "SSH_CONNECTION=10.127.8.17 55458 10.127.79.236 22",
+    "SLURM_DISTRIBUTION=cyclic",
+    "ZE_AFFINITY_MASK=0",
+    "HYDRA_BOOTSTRAP=slurm",
+    "MODULEPATH_ROOT=\/etc\/qlustar\/common\/lmod\/modulefiles",
+    "CUDA_VISIBLE_DEVICES=0",
+    "SLURM_TOPOLOGY_ADDR_PATTERN=node",
+    "SLURM_SRUN_COMM_HOST=192.168.62.107",
+    "XDG_SESSION_CLASS=user",
+    "LMOD_PKG=\/usr\/share\/lmod\/lmod",
+    "SLURM_SCRIPT_CONTEXT=prolog_task",
+    "SLURM_MEM_PER_NODE=16384",
+    "TERM=xterm-256color",
+    "_CE_CONDA=",
+    "CPLUS_INCLUDE_PATH=\/apps\/local\/nvidia\/cuda-12.0\/include",
+    "USER=zonghang.li",
+    "SLURM_NODELIST=gpu-[07-08]",
+    "CUDA_PATH=\/apps\/local\/nvidia\/cuda-12.0",
+    "ENVIRONMENT=BATCH",
+    "GPU_DEVICE_ORDINAL=0",
+    "CONDA_SHLVL=1",
+    "SLURM_SRUN_COMM_PORT=46419",
+    "LOADEDMODULES=nvidia\/cuda\/12.0",
+    "SLURM_STEP_ID=0",
+    "SLURM_JOB_ACCOUNT=cscc-users",
+    "SLURM_PRIO_PROCESS=0",
+    "SLURM_NPROCS=2",
+    "LMOD_ROOT=\/usr\/share\/lmod",
+    "SHLVL=2",
+    "SLURM_NNODES=2",
+    "INPUTRC=\/etc\/qlustar\/common\/skel\/misc\/inputrc",
+    "BASH_ENV=\/usr\/share\/lmod\/lmod\/init\/bash",
+    "PAGER=less -s",
+    "LMOD_sys=Linux",
+    "LC_MESSAGES=POSIX",
+    "XDG_SESSION_ID=19520",
+    "SLURM_SUBMIT_HOST=ciai-login-1",
+    "PMI_RANK=0",
+    "_ModuleTable001_=X01vZHVsZVRhYmxlXyA9IHsKTVR2ZXJzaW9uID0gMywKY19yZWJ1aWxkVGltZSA9IGZhbHNlLApjX3Nob3J0VGltZSA9IGZhbHNlLApkZXB0aFQgPSB7fSwKZmFtaWx5ID0ge30sCm1UID0gewpbIm52aWRpYS9jdWRhIl0gPSB7CmZuID0gIi9hcHBzL2xvY2FsL2xtb2QvbW9kdWxlZmlsZXMvbnZpZGlhL2N1ZGEvMTIuMCIsCmZ1bGxOYW1lID0gIm52aWRpYS9jdWRhLzEyLjAiLApsb2FkT3JkZXIgPSAxLApwcm9wVCA9IHt9LApzdGFja0RlcHRoID0gMCwKc3RhdHVzID0gImFjdGl2ZSIsCnVzZXJOYW1lID0gIm52aWRpYS9jdWRhLzEyLjAiLAp3ViA9ICIwMDAwMDAwMTIuKnpmaW5hbCIsCn0sCn0sCm1wYXRoQSA9IHsKIi91c3Ivc2hhcmUvbG1vZC9sbW9kL21vZHVsZWZpbGVz",
+    "CONDA_PYTHON_EXE=\/apps\/local\/anaconda3\/bin\/python",
+    "LD_LIBRARY_PATH=\/home\/zonghang.li\/.conda\/envs\/megatron-lm\/lib\/python3.12\/site-packages\/nvidia\/nccl\/lib:\/apps\/local\/anaconda3\/lib:\/apps\/local\/nvidia\/cuda-12.0\/lib64:\/home\/zonghang.li\/.conda\/envs\/megatron-lm\/lib\/python3.12\/site-packages\/nvidia\/nccl\/lib::",
+    "XDG_RUNTIME_DIR=\/run\/user\/2655",
+    "SLURM_JOB_ID=165377",
+    "SLURM_NODEID=0",
+    "SLURM_STEP_NUM_NODES=2",
+    "SSH_CLIENT=10.127.8.17 55458 22",
+    "CONDA_DEFAULT_ENV=base",
+    "SLURM_STEP_TASKS_PER_NODE=1(x2)",
+    "CUDA_HOME=\/apps\/local\/nvidia\/cuda-12.0",
+    "SLURM_MPI_TYPE=pmi2",
+    "__LMOD_REF_COUNT_C_INCLUDE_PATH=\/apps\/local\/nvidia\/cuda-12.0\/include:1",
+    "XDG_DATA_DIRS=\/usr\/local\/share:\/usr\/share:\/var\/lib\/snapd\/desktop",
+    "PMI_JOBID=165377.0",
+    "SLURM_CONF=\/etc\/qlustar\/common\/slurm-llnl\/slurm.conf",
+    "PATH=\/apps\/local\/nvidia\/cuda-12.0\/bin:\/apps\/local\/anaconda3\/bin:\/usr\/bin:\/bin:\/usr\/sbin:\/sbin",
+    "SLURM_JOB_NAME=nccl-ar-perf-n2g1",
+    "MODULEPATH=\/usr\/share\/lmod\/lmod\/modulefiles:\/etc\/qlustar\/common\/lmod\/modulefiles:\/apps\/local\/lmod\/modulefiles",
+    "SLURM_NTASKS_PER_NODE=1",
+    "_LMFILES_=\/apps\/local\/lmod\/modulefiles\/nvidia\/cuda\/12.0",
+    "DBUS_SESSION_BUS_ADDRESS=unix:path=\/run\/user\/2655\/bus",
+    "LMOD_CMD=\/usr\/share\/lmod\/lmod\/libexec\/lmod",
+    "C_INCLUDE_PATH=\/apps\/local\/nvidia\/cuda-12.0\/include",
+    "SSH_TTY=\/dev\/pts\/167",
+    "__LMOD_REF_COUNT_LD_LIBRARY_PATH=\/apps\/local\/nvidia\/cuda-12.0\/lib64:1;\/home\/zonghang.li\/.conda\/envs\/megatron-lm\/lib\/python3.12\/site-packages\/nvidia\/nccl\/lib:2",
+    "SLURM_STEP_LAUNCHER_PORT=46419",
+    "OMPI_MCA_plm_slurm_args=--external-launcher",
+    "SLURM_JOB_GID=2012",
+    "OLDPWD=\/home\/zonghang.li\/calculon\/scripts\/slurm\/nvidia",
+    "SLURM_JOB_NODELIST=gpu-[07-08]",
+    "I_MPI_HYDRA_BOOTSTRAP=slurm",
+    "BASH_FUNC_ml%%=() {  eval \"$($LMOD_DIR\/ml_cmd \"$@\")\"\n}",
+    "BASH_FUNC_module%%=() {  if [ -z \"${LMOD_SH_DBG_ON+x}\" ]; then\n case \"$-\" in \n *v*x*)\n __lmod_sh_dbg='vx'\n ;;\n *v*)\n __lmod_sh_dbg='v'\n ;;\n *x*)\n __lmod_sh_dbg='x'\n ;;\n esac;\n fi;\n if [ -n \"${__lmod_sh_dbg:-}\" ]; then\n set +$__lmod_sh_dbg;\n echo \"Shell debugging temporarily silenced: export LMOD_SH_DBG_ON=1 for Lmod's output\" 1>&2;\n fi;\n eval \"$($LMOD_CMD $LMOD_SHELL_PRGM \"$@\")\" && eval \"$(${LMOD_SETTARG_CMD:-:} -s sh)\";\n __lmod_my_status=$?;\n if [ -n \"${__lmod_sh_dbg:-}\" ]; then\n echo \"Shell debugging restarted\" 1>&2;\n set -$__lmod_sh_dbg;\n fi;\n unset __lmod_sh_dbg;\n return $__lmod_my_status\n}"
+  ],
+  "nccl_version": 22105,
+  "config": {
+    "nthreads": 1,
+    "ngpus": 1,
+    "minimum_bytes": 8,
+    "maximum_bytes": 2147483648,
+    "step_factor": 2,
+    "warmup_iters": 1,
+    "iterations": 20,
+    "aggregated_iterations": 1,
+    "validation": 1,
+    "graph": 0,
+    "blocking_collectives": "false",
+    "parallel_init": "false",
+    "devices": [
+      {
+        "rank": 0,
+        "group": 0,
+        "pid": 4042027,
+        "hostname": "gpu-07",
+        "device": 0,
+        "device_hex": "0000:01:00",
+        "device_info": "NVIDIA A100-SXM4-40GB"
+      },
+      {
+        "rank": 1,
+        "group": 0,
+        "pid": 3446182,
+        "hostname": "gpu-08",
+        "device": 0,
+        "device_hex": "0000:01:00",
+        "device_info": "NVIDIA A100-SXM4-40GB"
+      }
+    ]
+  },
+  "results": [
+    {
+      "size": 8,
+      "count": 2,
+      "type": "float",
+      "redop": "sum",
+      "root": "    -1",
+      "out_of_place": {
+        "time": 18.187325,
+        "alg_bw": 0.000440,
+        "bus_bw": 0.000440,
+        "nwrong": 0.000000
+      },
+      "in_place": {
+        "time": 19.530050,
+        "alg_bw": 0.000410,
+        "bus_bw": 0.000410,
+        "nwrong": 0.000000
+      },
+      "actual_iterations": 20,
+      "experiment_name": ""
+    },
+    {
+      "size": 16,
+      "count": 4,
+      "type": "float",
+      "redop": "sum",
+      "root": "    -1",
+      "out_of_place": {
+        "time": 17.638825,
+        "alg_bw": 0.000907,
+        "bus_bw": 0.000907,
+        "nwrong": 0.000000
+      },
+      "in_place": {
+        "time": 19.540550,
+        "alg_bw": 0.000819,
+        "bus_bw": 0.000819,
+        "nwrong": 0.000000
+      },
+      "actual_iterations": 20,
+      "experiment_name": ""
+    },
+    {
+      "size": 32,
+      "count": 8,
+      "type": "float",
+      "redop": "sum",
+      "root": "    -1",
+      "out_of_place": {
+        "time": 20.441550,
+        "alg_bw": 0.001565,
+        "bus_bw": 0.001565,
+        "nwrong": 0.000000
+      },
+      "in_place": {
+        "time": 19.944550,
+        "alg_bw": 0.001604,
+        "bus_bw": 0.001604,
+        "nwrong": 0.000000
+      },
+      "actual_iterations": 20,
+      "experiment_name": ""
+    },
+    {
+      "size": 64,
+      "count": 16,
+      "type": "float",
+      "redop": "sum",
+      "root": "    -1",
+      "out_of_place": {
+        "time": 19.824550,
+        "alg_bw": 0.003228,
+        "bus_bw": 0.003228,
+        "nwrong": 0.000000
+      },
+      "in_place": {
+        "time": 21.710550,
+        "alg_bw": 0.002948,
+        "bus_bw": 0.002948,
+        "nwrong": 0.000000
+      },
+      "actual_iterations": 20,
+      "experiment_name": ""
+    },
+    {
+      "size": 128,
+      "count": 32,
+      "type": "float",
+      "redop": "sum",
+      "root": "    -1",
+      "out_of_place": {
+        "time": 21.881025,
+        "alg_bw": 0.005850,
+        "bus_bw": 0.005850,
+        "nwrong": 0.000000
+      },
+      "in_place": {
+        "time": 21.866275,
+        "alg_bw": 0.005854,
+        "bus_bw": 0.005854,
+        "nwrong": 0.000000
+      },
+      "actual_iterations": 20,
+      "experiment_name": ""
+    },
+    {
+      "size": 256,
+      "count": 64,
+      "type": "float",
+      "redop": "sum",
+      "root": "    -1",
+      "out_of_place": {
+        "time": 22.401500,
+        "alg_bw": 0.011428,
+        "bus_bw": 0.011428,
+        "nwrong": 0.000000
+      },
+      "in_place": {
+        "time": 19.666050,
+        "alg_bw": 0.013017,
+        "bus_bw": 0.013017,
+        "nwrong": 0.000000
+      },
+      "actual_iterations": 20,
+      "experiment_name": ""
+    },
+    {
+      "size": 512,
+      "count": 128,
+      "type": "float",
+      "redop": "sum",
+      "root": "    -1",
+      "out_of_place": {
+        "time": 20.754775,
+        "alg_bw": 0.024669,
+        "bus_bw": 0.024669,
+        "nwrong": 0.000000
+      },
+      "in_place": {
+        "time": 20.720025,
+        "alg_bw": 0.024710,
+        "bus_bw": 0.024710,
+        "nwrong": 0.000000
+      },
+      "actual_iterations": 20,
+      "experiment_name": ""
+    },
+    {
+      "size": 1024,
+      "count": 256,
+      "type": "float",
+      "redop": "sum",
+      "root": "    -1",
+      "out_of_place": {
+        "time": 23.857475,
+        "alg_bw": 0.042922,
+        "bus_bw": 0.042922,
+        "nwrong": 0.000000
+      },
+      "in_place": {
+        "time": 23.348750,
+        "alg_bw": 0.043857,
+        "bus_bw": 0.043857,
+        "nwrong": 0.000000
+      },
+      "actual_iterations": 20,
+      "experiment_name": ""
+    },
+    {
+      "size": 2048,
+      "count": 512,
+      "type": "float",
+      "redop": "sum",
+      "root": "    -1",
+      "out_of_place": {
+        "time": 23.639250,
+        "alg_bw": 0.086636,
+        "bus_bw": 0.086636,
+        "nwrong": 0.000000
+      },
+      "in_place": {
+        "time": 23.791750,
+        "alg_bw": 0.086080,
+        "bus_bw": 0.086080,
+        "nwrong": 0.000000
+      },
+      "actual_iterations": 20,
+      "experiment_name": ""
+    },
+    {
+      "size": 4096,
+      "count": 1024,
+      "type": "float",
+      "redop": "sum",
+      "root": "    -1",
+      "out_of_place": {
+        "time": 22.388525,
+        "alg_bw": 0.182951,
+        "bus_bw": 0.182951,
+        "nwrong": 0.000000
+      },
+      "in_place": {
+        "time": 22.330775,
+        "alg_bw": 0.183424,
+        "bus_bw": 0.183424,
+        "nwrong": 0.000000
+      },
+      "actual_iterations": 20,
+      "experiment_name": ""
+    },
+    {
+      "size": 8192,
+      "count": 2048,
+      "type": "float",
+      "redop": "sum",
+      "root": "    -1",
+      "out_of_place": {
+        "time": 24.410725,
+        "alg_bw": 0.335590,
+        "bus_bw": 0.335590,
+        "nwrong": 0.000000
+      },
+      "in_place": {
+        "time": 27.109975,
+        "alg_bw": 0.302177,
+        "bus_bw": 0.302177,
+        "nwrong": 0.000000
+      },
+      "actual_iterations": 20,
+      "experiment_name": ""
+    },
+    {
+      "size": 16384,
+      "count": 4096,
+      "type": "float",
+      "redop": "sum",
+      "root": "    -1",
+      "out_of_place": {
+        "time": 31.267700,
+        "alg_bw": 0.523991,
+        "bus_bw": 0.523991,
+        "nwrong": 0.000000
+      },
+      "in_place": {
+        "time": 31.327425,
+        "alg_bw": 0.522992,
+        "bus_bw": 0.522992,
+        "nwrong": 0.000000
+      },
+      "actual_iterations": 20,
+      "experiment_name": ""
+    },
+    {
+      "size": 32768,
+      "count": 8192,
+      "type": "float",
+      "redop": "sum",
+      "root": "    -1",
+      "out_of_place": {
+        "time": 37.455600,
+        "alg_bw": 0.874849,
+        "bus_bw": 0.874849,
+        "nwrong": 0.000000
+      },
+      "in_place": {
+        "time": 41.266325,
+        "alg_bw": 0.794062,
+        "bus_bw": 0.794062,
+        "nwrong": 0.000000
+      },
+      "actual_iterations": 20,
+      "experiment_name": ""
+    },
+    {
+      "size": 65536,
+      "count": 16384,
+      "type": "float",
+      "redop": "sum",
+      "root": "    -1",
+      "out_of_place": {
+        "time": 56.814400,
+        "alg_bw": 1.153510,
+        "bus_bw": 1.153510,
+        "nwrong": 0.000000
+      },
+      "in_place": {
+        "time": 58.322650,
+        "alg_bw": 1.123680,
+        "bus_bw": 1.123680,
+        "nwrong": 0.000000
+      },
+      "actual_iterations": 20,
+      "experiment_name": ""
+    },
+    {
+      "size": 131072,
+      "count": 32768,
+      "type": "float",
+      "redop": "sum",
+      "root": "    -1",
+      "out_of_place": {
+        "time": 97.073250,
+        "alg_bw": 1.350238,
+        "bus_bw": 1.350238,
+        "nwrong": 0.000000
+      },
+      "in_place": {
+        "time": 98.958975,
+        "alg_bw": 1.324508,
+        "bus_bw": 1.324508,
+        "nwrong": 0.000000
+      },
+      "actual_iterations": 20,
+      "experiment_name": ""
+    },
+    {
+      "size": 262144,
+      "count": 65536,
+      "type": "float",
+      "redop": "sum",
+      "root": "    -1",
+      "out_of_place": {
+        "time": 160.578350,
+        "alg_bw": 1.632499,
+        "bus_bw": 1.632499,
+        "nwrong": 0.000000
+      },
+      "in_place": {
+        "time": 164.819575,
+        "alg_bw": 1.590491,
+        "bus_bw": 1.590491,
+        "nwrong": 0.000000
+      },
+      "actual_iterations": 20,
+      "experiment_name": ""
+    },
+    {
+      "size": 524288,
+      "count": 131072,
+      "type": "float",
+      "redop": "sum",
+      "root": "    -1",
+      "out_of_place": {
+        "time": 286.995250,
+        "alg_bw": 1.826818,
+        "bus_bw": 1.826818,
+        "nwrong": 0.000000
+      },
+      "in_place": {
+        "time": 293.152975,
+        "alg_bw": 1.788445,
+        "bus_bw": 1.788445,
+        "nwrong": 0.000000
+      },
+      "actual_iterations": 20,
+      "experiment_name": ""
+    },
+    {
+      "size": 1048576,
+      "count": 262144,
+      "type": "float",
+      "redop": "sum",
+      "root": "    -1",
+      "out_of_place": {
+        "time": 535.893225,
+        "alg_bw": 1.956688,
+        "bus_bw": 1.956688,
+        "nwrong": 0.000000
+      },
+      "in_place": {
+        "time": 534.500750,
+        "alg_bw": 1.961786,
+        "bus_bw": 1.961786,
+        "nwrong": 0.000000
+      },
+      "actual_iterations": 20,
+      "experiment_name": ""
+    },
+    {
+      "size": 2097152,
+      "count": 524288,
+      "type": "float",
+      "redop": "sum",
+      "root": "    -1",
+      "out_of_place": {
+        "time": 582.067250,
+        "alg_bw": 3.602938,
+        "bus_bw": 3.602938,
+        "nwrong": 0.000000
+      },
+      "in_place": {
+        "time": 581.065025,
+        "alg_bw": 3.609152,
+        "bus_bw": 3.609152,
+        "nwrong": 0.000000
+      },
+      "actual_iterations": 20,
+      "experiment_name": ""
+    },
+    {
+      "size": 4194304,
+      "count": 1048576,
+      "type": "float",
+      "redop": "sum",
+      "root": "    -1",
+      "out_of_place": {
+        "time": 1108.378075,
+        "alg_bw": 3.784182,
+        "bus_bw": 3.784182,
+        "nwrong": 0.000000
+      },
+      "in_place": {
+        "time": 1112.137775,
+        "alg_bw": 3.771389,
+        "bus_bw": 3.771389,
+        "nwrong": 0.000000
+      },
+      "actual_iterations": 20,
+      "experiment_name": ""
+    },
+    {
+      "size": 8388608,
+      "count": 2097152,
+      "type": "float",
+      "redop": "sum",
+      "root": "    -1",
+      "out_of_place": {
+        "time": 2124.985275,
+        "alg_bw": 3.947608,
+        "bus_bw": 3.947608,
+        "nwrong": 0.000000
+      },
+      "in_place": {
+        "time": 2136.301925,
+        "alg_bw": 3.926696,
+        "bus_bw": 3.926696,
+        "nwrong": 0.000000
+      },
+      "actual_iterations": 20,
+      "experiment_name": ""
+    },
+    {
+      "size": 16777216,
+      "count": 4194304,
+      "type": "float",
+      "redop": "sum",
+      "root": "    -1",
+      "out_of_place": {
+        "time": 4259.164750,
+        "alg_bw": 3.939086,
+        "bus_bw": 3.939086,
+        "nwrong": 0.000000
+      },
+      "in_place": {
+        "time": 4205.591300,
+        "alg_bw": 3.989264,
+        "bus_bw": 3.989264,
+        "nwrong": 0.000000
+      },
+      "actual_iterations": 20,
+      "experiment_name": ""
+    },
+    {
+      "size": 33554432,
+      "count": 8388608,
+      "type": "float",
+      "redop": "sum",
+      "root": "    -1",
+      "out_of_place": {
+        "time": 8376.125025,
+        "alg_bw": 4.005961,
+        "bus_bw": 4.005961,
+        "nwrong": 0.000000
+      },
+      "in_place": {
+        "time": 8412.577625,
+        "alg_bw": 3.988603,
+        "bus_bw": 3.988603,
+        "nwrong": 0.000000
+      },
+      "actual_iterations": 20,
+      "experiment_name": ""
+    },
+    {
+      "size": 67108864,
+      "count": 16777216,
+      "type": "float",
+      "redop": "sum",
+      "root": "    -1",
+      "out_of_place": {
+        "time": 16641.537175,
+        "alg_bw": 4.032612,
+        "bus_bw": 4.032612,
+        "nwrong": 0.000000
+      },
+      "in_place": {
+        "time": 16602.654550,
+        "alg_bw": 4.042056,
+        "bus_bw": 4.042056,
+        "nwrong": 0.000000
+      },
+      "actual_iterations": 20,
+      "experiment_name": ""
+    },
+    {
+      "size": 134217728,
+      "count": 33554432,
+      "type": "float",
+      "redop": "sum",
+      "root": "    -1",
+      "out_of_place": {
+        "time": 33030.813025,
+        "alg_bw": 4.063410,
+        "bus_bw": 4.063410,
+        "nwrong": 0.000000
+      },
+      "in_place": {
+        "time": 32932.292575,
+        "alg_bw": 4.075566,
+        "bus_bw": 4.075566,
+        "nwrong": 0.000000
+      },
+      "actual_iterations": 20,
+      "experiment_name": ""
+    },
+    {
+      "size": 268435456,
+      "count": 67108864,
+      "type": "float",
+      "redop": "sum",
+      "root": "    -1",
+      "out_of_place": {
+        "time": 65963.110175,
+        "alg_bw": 4.069478,
+        "bus_bw": 4.069478,
+        "nwrong": 0.000000
+      },
+      "in_place": {
+        "time": 65786.623925,
+        "alg_bw": 4.080396,
+        "bus_bw": 4.080396,
+        "nwrong": 0.000000
+      },
+      "actual_iterations": 20,
+      "experiment_name": ""
+    },
+    {
+      "size": 536870912,
+      "count": 134217728,
+      "type": "float",
+      "redop": "sum",
+      "root": "    -1",
+      "out_of_place": {
+        "time": 133117.025275,
+        "alg_bw": 4.033075,
+        "bus_bw": 4.033075,
+        "nwrong": 0.000000
+      },
+      "in_place": {
+        "time": 132997.187350,
+        "alg_bw": 4.036709,
+        "bus_bw": 4.036709,
+        "nwrong": 0.000000
+      },
+      "actual_iterations": 20,
+      "experiment_name": ""
+    },
+    {
+      "size": 1073741824,
+      "count": 268435456,
+      "type": "float",
+      "redop": "sum",
+      "root": "    -1",
+      "out_of_place": {
+        "time": 272976.577600,
+        "alg_bw": 3.933458,
+        "bus_bw": 3.933458,
+        "nwrong": 0.000000
+      },
+      "in_place": {
+        "time": 273199.266250,
+        "alg_bw": 3.930251,
+        "bus_bw": 3.930251,
+        "nwrong": 0.000000
+      },
+      "actual_iterations": 20,
+      "experiment_name": ""
+    },
+    {
+      "size": 2147483648,
+      "count": 536870912,
+      "type": "float",
+      "redop": "sum",
+      "root": "    -1",
+      "out_of_place": {
+        "time": 572333.938125,
+        "alg_bw": 3.752152,
+        "bus_bw": 3.752152,
+        "nwrong": 0.000000
+      },
+      "in_place": {
+        "time": 573087.521500,
+        "alg_bw": 3.747218,
+        "bus_bw": 3.747218,
+        "nwrong": 0.000000
+      },
+      "actual_iterations": 20,
+      "experiment_name": ""
+    }
+  ],
+  "out_of_bounds": {
+    "count": 0,
+    "okay": "true"
+  },
+  "average_bus_bandwidith": {
+    "bandwidith": 1.830119,
+    "okay": "unchecked"
+  },
+  "errors": [
+    ""
+  ],
+  "end_time": "2025-12-05 22:02:15"
+}

@@ -1,0 +1,9 @@
+{
+  "hidden": 3200,
+  "feedforward": 8640,
+  "seq_size": 2048,
+  "attn_heads": 32,
+  "attn_size": 100,
+  "num_blocks": 32,
+  "vocab_size": 50257
+}

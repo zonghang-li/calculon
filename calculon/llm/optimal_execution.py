@@ -86,6 +86,22 @@ class OptimalExecution(calculon.CommandLine):
                     help='Search optimizer_offload (otherwise fixed False)')
     sp.add_argument('--pipeline-interleaving', action='store_true',
                     help='Search pipeline_interleaving (otherwise fixed to default)')
+    sp.add_argument('--search-global-bs', action='store_true',
+                    help='Search batch_size from 1 to batch_size')
+    sp.add_argument('--search-num-procs', action='store_true',
+                    help='Search num_procs from 1 to num_procs')
+
+  @staticmethod
+  def get_num_procs_candidates(step_size, max_num_procs):
+    np_candidates = []
+    v = 1
+    while v <= max_num_procs and v <= step_size:
+      np_candidates.append(v)
+      v *= 2
+    while v <= max_num_procs:
+        np_candidates.append(v)
+        v *= 2
+    return np_candidates
 
   @staticmethod
   def run_command(logger, args):
@@ -95,25 +111,28 @@ class OptimalExecution(calculon.CommandLine):
     activation_recompute_choices = ['full', 'attn_only', 'none'] if args.activation_recompute else ['none']
     tensor_par_comm_type_choices = ['ar', 'p2p_rs_ag', 'rs_ag'] if args.tensor_par_comm_type else ['ar']
     params = []
-    for tp in Llm.get_all_tensor_parallelisms(args.num_procs, app.hidden, app.attn_heads, app.kv_groups):
-      for pp in Llm.get_all_pipeline_parallelisms(args.num_procs, tp, app.num_blocks):
-        dp = Llm.get_data_parallelism(args.num_procs, tp, pp)
-        valid_ppints = Llm.get_valid_pipeline_interleavings(app.num_blocks, pp)
-        if not args.pipeline_interleaving: valid_ppints = list(valid_ppints)[:1]
-        for ppint in valid_ppints:
-          batch_size = OptimalExecution.get_batch_size(dp, args.max_batch_size)
-          if batch_size is None: continue
-          for activation_recompute in activation_recompute_choices:
-            optimizer_sharding_choices = pick(dp > 1, [True, False], [False]) if args.optimizer_sharding else [False]
-            for optimizer_sharding in optimizer_sharding_choices:
-              for tensor_par_comm_type in tensor_par_comm_type_choices:
-                params.append(
-                  (args.debug, args.top_n, args.layers, args.num_procs,
-                   args.max_batch_size, args.datatype, app, syst, tp, pp, dp,
-                   ppint, batch_size, activation_recompute, optimizer_sharding,
-                   tensor_par_comm_type, args.fused_activation, args.mbs_break,
-                   not args.no_tp_overlap, not args.no_dp_overlap, args.seq_par_ag_redo,
-                   args.weight_offload, args.activations_offload, args.optimizer_offload))
+    for np in OptimalExecution.get_num_procs_candidates(syst.networks[-2].size, args.num_procs):
+      for tp in Llm.get_all_tensor_parallelisms(np, app.hidden, app.attn_heads, app.kv_groups):
+        for pp in Llm.get_all_pipeline_parallelisms(np, tp, app.num_blocks):
+          dp = Llm.get_data_parallelism(np, tp, pp)
+          valid_ppints = Llm.get_valid_pipeline_interleavings(app.num_blocks, pp)
+          if not args.pipeline_interleaving: valid_ppints = list(valid_ppints)[:1]
+          for ppint in valid_ppints:
+            batch_size = OptimalExecution.get_batch_size(dp, args.max_batch_size)
+            if batch_size is None: continue
+            min_batch_size = dp if args.search_global_bs else batch_size
+            for bs in range(min_batch_size, batch_size + 1, dp):
+              for activation_recompute in activation_recompute_choices:
+                optimizer_sharding_choices = pick(dp > 1, [True, False], [False]) if args.optimizer_sharding else [False]
+                for optimizer_sharding in optimizer_sharding_choices:
+                  for tensor_par_comm_type in tensor_par_comm_type_choices:
+                    params.append(
+                      (args.debug, args.top_n, args.layers, np,
+                       args.max_batch_size, args.datatype, app, syst, tp, pp, dp,
+                       ppint, bs, activation_recompute, optimizer_sharding,
+                       tensor_par_comm_type, args.fused_activation, args.mbs_break,
+                       not args.no_tp_overlap, not args.no_dp_overlap, args.seq_par_ag_redo,
+                       args.weight_offload, args.activations_offload, args.optimizer_offload))
 
     # Runs parallel searches
     start_time = datetime.datetime.now()
