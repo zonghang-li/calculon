@@ -1262,8 +1262,11 @@ class Llm:
     # act_size * bytes_per_element, otherwise 0. This represents the per‑block activation
     # explicitly kept when recomputing everything else during BW.
     if self.exe.training and self.exe.activation_recompute == "full":
-      self._block_act_checkpoint_size = \
-        self._activation_size * self._bytes_per_element
+      if self.exe._sequence_par or self.exe._pipeline_par_rs_ag:
+        ckpt_elems = self._seq_par_activation_size
+      else:
+        ckpt_elems = self._activation_size
+      self._block_act_checkpoint_size = ckpt_elems * self._bytes_per_element
     else:
       self._block_act_checkpoint_size = 0
 
@@ -1347,6 +1350,12 @@ class Llm:
     # TP overlap bandwidth requirement
     self._tp_bw_overlap_req = 0             # The maximum per‑tile link bandwidth required (across FW/BW and base/edge) to fully hide TP collectives under compute. Driven primarily by LinearOverlapped’s tiling model
 
+    re_fw_flops_since_ckpt = 0
+    re_fw_flops_time_since_ckpt = 0
+    re_fw_mem_accessed_since_ckpt = 0
+    re_fw_mem_time_since_ckpt = 0
+    re_fw_time_since_ckpt = 0
+
     # The loop accumulates per‑microbatch, per‑block stats by summing each layer’s contribution
     for layer in self._llm_block:
       # Forward pass (FW): compute, memory, overlapped time
@@ -1354,11 +1363,23 @@ class Llm:
       # bytes & time, and (d) processing time (compute + memory with any modeled overlap)
       # for FW. For layers like LinearOverlapped, it also bakes in TP comm overlap and sets
       # up “exposed net” bookkeeping
-      self._block_fw_flops += layer.get_fw_flops()
-      self._block_fw_flops_time += layer.compute_flops_time("fw")
-      self._block_fw_mem_accessed += layer.get_fw_mem_accessed()
-      self._block_fw_mem_time += layer.compute_mem_time("fw")
-      self._block_fw_time += layer.compute_processing_time("fw")
+      layer_fw_flops = layer.get_fw_flops()
+      layer_fw_flops_time = layer.compute_flops_time("fw")
+      layer_fw_mem_accessed = layer.get_fw_mem_accessed()
+      layer_fw_mem_time = layer.compute_mem_time("fw")
+      layer_fw_time = layer.compute_processing_time("fw")
+
+      self._block_fw_flops += layer_fw_flops
+      self._block_fw_flops_time += layer_fw_flops_time
+      self._block_fw_mem_accessed += layer_fw_mem_accessed
+      self._block_fw_mem_time += layer_fw_mem_time
+      self._block_fw_time += layer_fw_time
+
+      re_fw_flops_since_ckpt += layer_fw_flops
+      re_fw_flops_time_since_ckpt += layer_fw_flops_time
+      re_fw_mem_accessed_since_ckpt += layer_fw_mem_accessed
+      re_fw_mem_time_since_ckpt += layer_fw_mem_time
+      re_fw_time_since_ckpt += layer_fw_time
 
       # FW TP comm: sizes, link time, exposed time, required bandwidth
       self._baseblock_fw_tp_size += layer.get_comm_bytes("fw", baseblock=True)  # returns the collective payload (e.g., AG/RS/AR) in bytes; non‑TP layers return 0
@@ -1378,11 +1399,17 @@ class Llm:
           # Model “re‑running FW from the last checkpoint up to here” during BW.
           # This works when only boundary layers set needs_recompute=True (e.g.,
           # a Fork that stores and later reuses)
-          self._block_re_flops += self._block_fw_flops
-          self._block_re_flops_time += self._block_fw_flops_time
-          self._block_re_mem_accessed += self._block_fw_mem_accessed
-          self._block_re_mem_time += self._block_fw_mem_time
-          self._block_re_time += layer.compute_processing_time("fw")
+          self._block_re_flops += re_fw_flops_since_ckpt
+          self._block_re_flops_time += re_fw_flops_time_since_ckpt
+          self._block_re_mem_accessed += re_fw_mem_accessed_since_ckpt
+          self._block_re_mem_time += re_fw_mem_time_since_ckpt
+          self._block_re_time += re_fw_time_since_ckpt
+
+          re_fw_flops_since_ckpt = 0
+          re_fw_flops_time_since_ckpt = 0
+          re_fw_mem_accessed_since_ckpt = 0
+          re_fw_mem_time_since_ckpt = 0
+          re_fw_time_since_ckpt = 0
 
         # “Re‑communication” during W‑grad (e.g., redo AG for RS/AG)
         if layer.get_recomm_flag():
@@ -1613,17 +1640,6 @@ class Llm:
                    human_format(self._edgeblock_recomm_size, 'bytes'))
     self.log.debug("%s %s", 'TP comm required bandwidth for tiled overlap:',
                    human_format(self._tp_bw_overlap_req, 'bandwidth'))
-
-  def _micros_in_flight(self) -> float:
-    """
-    Resident microbatches for capacity accounting.
-    Under 1F1B, at any instant a stage holds at most min(M, PP) micros.
-    Do not include warm-up/flush stretch factors here (those are time effects).
-    """
-    pp = int(getattr(self.exe, "pipeline_par", 1))
-    if pp <= 1: return 1.0
-    num_micros = int(getattr(self.exe, "_num_microbatches", 1))
-    return float(min(num_micros, pp))
 
   def _compute_batch_stats(self):
     """
@@ -2244,16 +2260,19 @@ class Llm:
 
     # memory capacity stats
     self._weight_space = self._block_weight_space * self._blocks_per_proc
-    # account for activation recomputation for full recompute we keep single block's activations
-    # (no scaling by L/gpu)
     if self.exe.training:
       mem_microbatches = min(self.exe._num_microbatches, self.exe.pipeline_par)
       if self.exe.activation_recompute == "full":
         assert self._block_act_storage_space == 0, \
           "We expect with full act recomputation we recompute ALL activations"
-        self._act_space = self._block_act_working_peak
-        self._act_checkpoint_size = (
-            self._blocks_per_proc * self._block_act_checkpoint_size * mem_microbatches)
+        self._act_space = self._block_act_working_peak * mem_microbatches
+        self._act_checkpoint_size = self._blocks_per_proc * self._block_act_checkpoint_size
+        if self.exe.pipeline_interleaving > 1:
+          self._act_checkpoint_size *= mem_microbatches * (
+              1 + (self.exe.pipeline_par - 1) /
+              (self.exe.pipeline_interleaving * self.exe.pipeline_par))
+        else:
+          self._act_checkpoint_size *= mem_microbatches
       else:
         # Without full recompute, we don't need checkpoints
         self._act_checkpoint_size = 0
@@ -2379,7 +2398,7 @@ class Llm:
     assert self._act_space >= self._block_act_working_peak
     assert self._act_checkpoint_size >= self._block_act_checkpoint_size
     assert self._weight_grad_space >= self._block_weight_grad_space_no_sharding
-    assert self._act_grad_space == self._block_act_grad_space
+    assert self._act_grad_space >= self._block_act_grad_space
     assert self._optimizer_space >= self._block_optimizer_space
 
     if not self.exe.training:
@@ -2602,24 +2621,16 @@ class Llm:
     return self._weight_space
 
   def get_act_space_min(self):
-    """
-    Minimum tier-1 activation capacity required on this rank (bytes).
-    - PP=1: peak working set for the current block + stored activations for the
-      remaining (blocks_per_proc-1) blocks in the stage.
-    - PP>1: at most min(num_microbatches, PP) micros are resident; stored
-      activations scale with blocks_per_proc * mem_microbatches.
-    - With full activation recompute, only the per-block peak working set is kept.
-    """
+    mem_microbatches = min(self.exe._num_microbatches, self.exe.pipeline_par)
     if self.exe.activation_recompute != 'full':
       if self.exe.pipeline_par == 1:
         return self._block_act_working_peak + \
           self._block_act_storage_space * (self._blocks_per_proc - 1)
       else:
-        mem_microbatches = min(self.exe._num_microbatches, self.exe.pipeline_par)
         return self._block_act_working_peak + \
           self._block_act_storage_space * (self._blocks_per_proc * mem_microbatches)
     else:
-      return self._block_act_working_peak
+      return self._block_act_working_peak * mem_microbatches
 
   def get_act_space(self):
     return self._act_space
@@ -2679,20 +2690,6 @@ class Llm:
       return 0
 
   def _get_mem_cap_reqs(self):
-    """
-    This method models the peak memory footprint of a transformer stage
-    under realistic parallelism (TP/PP/DP) and overlap behavior.
-
-    Rather than simply summing all tensor spaces, it approximates the
-    true temporal residency of major memory components — weights,
-    optimizer states, forward activations, and gradients — and distinguishes:
-      • Forward-dominated peaks (when activations dominate memory)
-      • Backward-dominated peaks (when gradients dominate memory)
-      • Their partial overlap (when both coexist briefly in PP=1 or 1F1B)
-
-    For offload cases, it separates device-resident (tier1) and offloaded
-    (tier2) memory to reflect multi-tier memory hierarchies realistically.
-    """
     if self.exe.weight_offload or self.exe.activations_offload or self.exe.optimizer_offload:
       tier1 = 0
       tier2 = 0
@@ -2736,14 +2733,8 @@ class Llm:
     bytes_grad = System.TypeSizes['float32'] if self.exe.grad_reduce_in_fp32 else bytes_param
     MG = int((W / max(bytes_param, 1)) * bytes_grad) if self.exe.training else 0
 
-    # PP>1: Megatron-style reserved max — forward activations + main grad + act grad
-    if self.exe.training and self.exe.pipeline_par > 1:
+    if self.exe.training:
       return fw_peak + MG + AG, 0
-
-    # PP=1
-    overlap_threshold = 1.25
-    if self.exe.training and (ACT <= overlap_threshold * MG):
-      return max(fw_peak, fw_peak + MG + AG), 0
     else:
       return fw_peak, 0
 

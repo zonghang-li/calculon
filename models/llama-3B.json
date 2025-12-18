@@ -5,5 +5,5 @@
   "attn_heads": 32,
   "attn_size": 100,
   "num_blocks": 32,
-  "vocab_size": 50257
+  "vocab_size": 50432
 }

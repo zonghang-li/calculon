@@ -111,7 +111,9 @@ class OptimalExecution(calculon.CommandLine):
     activation_recompute_choices = ['full', 'attn_only', 'none'] if args.activation_recompute else ['none']
     tensor_par_comm_type_choices = ['ar', 'p2p_rs_ag', 'rs_ag'] if args.tensor_par_comm_type else ['ar']
     params = []
-    for np in OptimalExecution.get_num_procs_candidates(syst.networks[-2].size, args.num_procs):
+    num_procs_candidates = [args.num_procs] if not args.search_num_procs \
+      else OptimalExecution.get_num_procs_candidates(syst.networks[-2].size, args.num_procs)
+    for np in num_procs_candidates:
       for tp in Llm.get_all_tensor_parallelisms(np, app.hidden, app.attn_heads, app.kv_groups):
         for pp in Llm.get_all_pipeline_parallelisms(np, tp, app.num_blocks):
           dp = Llm.get_data_parallelism(np, tp, pp)
