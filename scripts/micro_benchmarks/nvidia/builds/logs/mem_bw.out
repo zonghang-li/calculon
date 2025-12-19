@@ -1,0 +1,9 @@
+=== Measuring Memory Bandwidths (mem1/mem2) ===
+       256 MB : mem1(stream)=   878.35 GB/s (eff=0.9383)  |  mem2(best H2D/D2H)=     8.62 GB/s (eff=1.0000)
+        64 MB : mem1(stream)=   851.21 GB/s (eff=0.9093)  |  mem2(best H2D/D2H)=     7.21 GB/s (eff=0.9153)
+         8 MB : mem1(stream)=   791.15 GB/s (eff=0.8452)  |  mem2(best H2D/D2H)=     9.31 GB/s (eff=1.0000)
+         1 MB : mem1(stream)=  1141.77 GB/s (eff=1.0000)  |  mem2(best H2D/D2H)=    10.16 GB/s (eff=1.0000)
+      0.25 MB : mem1(stream)=   350.80 GB/s (eff=0.3747)  |  mem2(best H2D/D2H)=    12.36 GB/s (eff=1.0000)
+    0.0625 MB : mem1(stream)=    88.11 GB/s (eff=0.0941)  |  mem2(best H2D/D2H)=    10.41 GB/s (eff=1.0000)
+MEM1_SUMMARY GiB=24 GBps=936 MB_eff=[(256,0.9383),(64,0.9093),(8,0.8452),(1,1.0000),(0.25,0.3747),(0.0625,0.0941),(0,0.0941)]
+MEM2_SUMMARY GiB=503 GBps=8 MB_eff=[(256,1.0000),(64,0.9153),(8,1.0000),(1,1.0000),(0.25,1.0000),(0.0625,1.0000),(0,1.0000)]

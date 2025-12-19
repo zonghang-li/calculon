@@ -245,6 +245,13 @@ class OptimalExecution(calculon.CommandLine):
                               best = OptimalExecution.update_list(best, curr,
                                                                   top_n)
                             except Llm.Error as ex:
+                              err_msg = str(ex)
+                              # 核心修改：如果是网络太小的错，直接忽略，不打印！
+                              if "isn't big enough" not in err_msg:
+                                  # 打印出真正的“凶手”！
+                                  print(f"\n[CRITICAL ERROR] Found a valid config but it failed: {err_msg}")
+                              
+                              # 保持原有逻辑
                               logger = logging.getLogger()
                               logger.debug(f'JSON:{exe_json}\nERROR:{ex}\n')
                               bad_exe_count += 1

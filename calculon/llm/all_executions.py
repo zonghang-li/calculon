@@ -109,7 +109,7 @@ class AllExecutions(calculon.CommandLine):
                                              tensor_par_overlap, seq_par_ag_redo,
                                              data_par_overlap, weight_offload,
                                              activations_offload, optimizer_offload,
-                                             True, True)
+                                             False, True)
                                       count += 1
 
   @staticmethod
@@ -186,8 +186,9 @@ class AllExecutions(calculon.CommandLine):
         statistics = model.get_stats_values()
         good.append(execution + statistics)
       except Llm.Error as ex:
-        logger = logging.getLogger()
-        logger.debug(f'ERROR:{ex}\n')
+        print(f"[Failure] TP={execution[1]} PP={execution[2]} DP={execution[3]} -> {ex}")
+        ##logger = logging.getLogger()
+        ##logger.debug(f'ERROR:{ex}\n')
     return good
 
   @staticmethod

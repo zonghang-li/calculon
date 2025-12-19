@@ -35,6 +35,7 @@ class Processor:
           for flops, flops_bin in batch_bin.items():
             flops = int(flops) * 1e9
             if last_bin_flops:
+              print(f"DEBUG: {datatype} batch {batch} flops {flops} last {last_bin_flops}")
               assert flops < last_bin_flops
             last_bin_flops = flops
             self._datatypes[datatype]['efficiency'][int(batch)][int(flops)] = flops_bin

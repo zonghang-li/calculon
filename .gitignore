@@ -43,3 +43,4 @@ nosetests.xml
 # Output and local configuration files
 output
 scripts/micro_benchmarks/*.json
+scripts/micro_benchmarks/nvidia/builds/logs/net_bw.out
