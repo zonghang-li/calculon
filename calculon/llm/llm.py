@@ -74,25 +74,41 @@ class Llm:
         'activation_recompute', 'pipeline_interleaving', 'optimizer_sharding',
         'tensor_par_comm_type', 'tensor_par_overlap', 'seq_par_ag_redo',
         'data_par_overlap', 'weight_offload', 'activations_offload',
-        'optimizer_offload', 'grad_reduce_in_fp32', 'training')
+        'optimizer_offload', 'grad_reduce_in_fp32', 'training',
+        # Additional modelling knobs to better match Megatron runtime
+        'pseudo_free_level',          # int: microbatch pseudo-free aggressiveness
+        'pseudo_free_tmp_level',      # int: extra tmp payloads freed per block
+        'working_peak_scale',         # float: scale factor for working peak (0..1)
+        'allocator_overhead',         # float: fraction or absolute bytes to add as allocator overhead
+        'enable_offload_modeling'     # bool: include offload modeling in cap reqs
+      )
 
     @staticmethod
     def from_json(cfg):
       cfg.setdefault('qkv_packing', True)
       cfg.setdefault('grad_reduce_in_fp32', False)
+      # defaults for new modelling knobs
+      cfg.setdefault('pseudo_free_level', 1)
+      cfg.setdefault('pseudo_free_tmp_level', 0)
+      cfg.setdefault('working_peak_scale', 1.0)
+      cfg.setdefault('allocator_overhead', 0.0)
+      cfg.setdefault('enable_offload_modeling', False)
       assert set(cfg.keys()) == set(Llm.Execution.fields())
       values = [cfg[field] for field in Llm.Execution.fields()]
       return Llm.Execution(*values)
 
     def __init__(self, num_procs, tensor_par, pipeline_par, data_par,
-                 tensor_par_net, pipeline_par_net, data_par_net,
-                 batch_size, microbatch_size, datatype, fused_activation,
-                 qkv_packing, attention_type, activation_recompute,
-                 pipeline_interleaving, optimizer_sharding,
-                 tensor_par_comm_type, tensor_par_overlap,
-                 seq_par_ag_redo, data_par_overlap, weight_offload,
-                 activations_offload, optimizer_offload,
-                 grad_reduce_in_fp32, training):
+           tensor_par_net, pipeline_par_net, data_par_net,
+           batch_size, microbatch_size, datatype, fused_activation,
+           qkv_packing, attention_type, activation_recompute,
+           pipeline_interleaving, optimizer_sharding,
+           tensor_par_comm_type, tensor_par_overlap,
+           seq_par_ag_redo, data_par_overlap, weight_offload,
+           activations_offload, optimizer_offload,
+           grad_reduce_in_fp32, training,
+           pseudo_free_level, pseudo_free_tmp_level,
+           working_peak_scale, allocator_overhead,
+           enable_offload_modeling):
       self.training = training
       self.num_procs = num_procs
       assert self.num_procs > 0
@@ -161,6 +177,13 @@ class Llm:
         assert self.training, \
           "We only perform optimizer offloading during training"
 
+      # New modelling knobs (defaults provided by from_json)
+      self.pseudo_free_level = int(pseudo_free_level)
+      self.pseudo_free_tmp_level = int(pseudo_free_tmp_level)
+      self.working_peak_scale = float(working_peak_scale)
+      self.allocator_overhead = float(allocator_overhead)
+      self.enable_offload_modeling = bool(enable_offload_modeling)
+
     def get_json(self):
       keys = Llm.Execution.fields()
       values = [
@@ -170,7 +193,10 @@ class Llm:
         self.activation_recompute, self.pipeline_interleaving, self.optimizer_sharding,
         self.tensor_par_comm_type, self.tensor_par_overlap, self.seq_par_ag_redo,
         self.data_par_overlap, self.weight_offload, self.activations_offload,
-        self.optimizer_offload, self.grad_reduce_in_fp32, self.training
+        self.optimizer_offload, self.grad_reduce_in_fp32, self.training,
+        self.pseudo_free_level, self.pseudo_free_tmp_level,
+        self.working_peak_scale, self.allocator_overhead,
+        self.enable_offload_modeling
       ]
       assert len(keys) == len(values)
       return dict(zip(keys, values))
@@ -1616,6 +1642,49 @@ class Llm:
     else:
       self._block_fw_pp_size = 0
 
+    # Model Megatron-style pseudo-freeing of pipeline outputs:
+    # In real Megatron schedules, after an activation is sent to the next
+    # pipeline stage it often gets pseudo-deallocated (replaced by a small
+    # scalar) while keeping the grad_fn, and the C++ autograd engine is used
+    # to support this. This reduces peak GPU memory even when
+    # activation_recompute == 'none'. To better match that behavior in our
+    # capacity model, subtract the bytes that are sent across PP boundaries
+    # from the stored-activation footprint when we're not doing full
+    # recompute and pipeline parallelism is active.
+    if (
+        self.exe.training
+        and self.exe.pipeline_par > 1
+        and (self.exe.activation_recompute == 'none' or self.exe.activation_recompute is None)
+    ):
+      # Ensure we don't go negative; this is a conservative model of the
+      # deallocation that Megatron performs after send.
+      self._block_act_storage_space = max(
+          0, self._block_act_storage_space - self._block_fw_pp_size
+      )
+
+    # Additional conservative modelling knobs to better mirror runtime freeing
+    # behaviour in Megatron. These are configured on `self.exe`.
+    tmp_level = max(0, int(getattr(self.exe, 'pseudo_free_tmp_level', 0)))
+    if tmp_level > 0:
+      extra = min(self._block_act_storage_space, self._block_fw_pp_size * tmp_level)
+      self._block_act_storage_space = max(0, self._block_act_storage_space - extra)
+
+    # Also model early freeing of activation-grad temporaries inside the block
+    # Some runtimes free intermediate activation-related temporaries earlier
+    # than the full block backward, lowering the block-level act-grad footprint.
+    if tmp_level > 0 and getattr(self, '_block_act_grad_space', None) is not None:
+      extra_ag = min(self._block_act_grad_space, self._block_fw_pp_size * tmp_level)
+      self._block_act_grad_space = max(0, self._block_act_grad_space - extra_ag)
+
+    # Scale working peak to simulate in-place/viewless/fused operator effects
+    working_scale = float(getattr(self.exe, 'working_peak_scale', 1.0))
+    if working_scale <= 0:
+      working_scale = 0.01
+    if working_scale > 1.0:
+      working_scale = 1.0
+    self._block_act_working_peak = int(self._block_act_working_peak * working_scale)
+
+
     # When training, BW sizes for TP and PP are same as FW
     if self.exe.training:
       self._block_bw_pp_size = self._block_fw_pp_size
@@ -2262,6 +2331,23 @@ class Llm:
     self._weight_space = self._block_weight_space * self._blocks_per_proc
     if self.exe.training:
       mem_microbatches = min(self.exe._num_microbatches, self.exe.pipeline_par)
+      # If we pseudo‑free pipeline outputs immediately after send (Megatron style),
+      # fewer microbatches remain resident on a stage. We support a configurable
+      # aggressiveness level `pseudo_free_level` (default 1) on `self.exe` so
+      # users can model progressively stronger runtime freeing behavior.
+      # - level=0: no pseudo‑free modelling
+      # - level=1: current conservative behaviour (reduce by 1 microbatch)
+      # - level>=2: reduce by up to `level` microbatches (bounded to >=1)
+      if (
+          self.exe.pipeline_par > 1
+          and getattr(self.exe, 'deallocate_pipeline_outputs', True)
+          and (self.exe.activation_recompute == 'none' or self.exe.activation_recompute is None)
+      ):
+        level = max(0, int(getattr(self.exe, 'pseudo_free_level', 1)))
+        if level > 0:
+          # reduce by at most (mem_microbatches - 1) to keep at least one
+          reduce_by = min(level, max(0, mem_microbatches - 1))
+          mem_microbatches = max(1, mem_microbatches - reduce_by)
       if self.exe.activation_recompute == "full":
         assert self._block_act_storage_space == 0, \
           "We expect with full act recomputation we recompute ALL activations"
@@ -2289,8 +2375,28 @@ class Llm:
               self._block_act_working_peak +
               self._block_act_storage_space * (self._blocks_per_proc * mem_microbatches)
           )
-      # Only need activation grads for a single block
-      self._act_grad_space = self._block_act_grad_space
+      # Only need activation grads for a single block. If pipeline outputs are
+      # pseudo‑freed immediately, account for possible reduction in resident
+      # activation‑gradient footprint. Use `pseudo_free_level` to scale the
+      # byte reduction conservatively. Reduction bytes are bounded by the
+      # per‑block total to avoid negative results.
+      if (
+          self.exe.pipeline_par > 1
+          and getattr(self.exe, 'deallocate_pipeline_outputs', True)
+          and (self.exe.activation_recompute == 'none' or self.exe.activation_recompute is None)
+      ):
+        level = max(0, int(getattr(self.exe, 'pseudo_free_level', 1)))
+        if level <= 0:
+          self._act_grad_space = self._block_act_grad_space
+        else:
+          # base reduction is one FW PP-sized payload; scale with level
+          # include any tmp-level frees already modeled per-block as additional reduction
+          tmp_level = max(0, int(getattr(self.exe, 'pseudo_free_tmp_level', 0)))
+          total_level = level + tmp_level
+          reduction_bytes = min(self._block_act_grad_space, self._block_fw_pp_size * total_level)
+          self._act_grad_space = max(0, self._block_act_grad_space - reduction_bytes)
+      else:
+        self._act_grad_space = self._block_act_grad_space
     else:
       # Inference: PP=1 still benefits from working-peak.
       if self.exe.pipeline_par == 1:
@@ -2398,7 +2504,13 @@ class Llm:
     assert self._act_space >= self._block_act_working_peak
     assert self._act_checkpoint_size >= self._block_act_checkpoint_size
     assert self._weight_grad_space >= self._block_weight_grad_space_no_sharding
-    assert self._act_grad_space >= self._block_act_grad_space
+    
+    # Activation gradients are only needed for a single block; when
+    # pipeline outputs are pseudo‑freed the resident A‑grad footprint
+    # can be smaller than the per‑block sum. Allow that here.
+    assert self._act_grad_space <= self._block_act_grad_space
+    #assert self._act_grad_space >= self._block_act_grad_space
+    
     assert self._optimizer_space >= self._block_optimizer_space
 
     if not self.exe.training:
@@ -2734,9 +2846,35 @@ class Llm:
     MG = int((W / max(bytes_param, 1)) * bytes_grad) if self.exe.training else 0
 
     if self.exe.training:
-      return fw_peak + MG + AG, 0
+      # Add allocator overhead if configured. Accept either a fractional
+      # overhead (<=1.0) applied to fw_peak, or an absolute byte value (>1.0).
+      overhead = float(getattr(self.exe, 'allocator_overhead', 0.0))
+      if overhead > 0:
+        if overhead <= 1.0:
+          overhead_bytes = int(fw_peak * overhead)
+        else:
+          overhead_bytes = int(overhead)
+      else:
+        overhead_bytes = 0
+      # If pseudo-free behaviour is enabled, activation grads and forward
+      # peak are often not simultaneously resident in Megatron-style
+      # schedules; model this by taking the max instead of summing them.
+      pf_level = max(0, int(getattr(self.exe, 'pseudo_free_level', 0)))
+      if pf_level > 0:
+        tier1_req = max(fw_peak, MG + AG) + overhead_bytes
+      else:
+        tier1_req = fw_peak + MG + AG + overhead_bytes
+      return tier1_req, 0
     else:
-      return fw_peak, 0
+      overhead = float(getattr(self.exe, 'allocator_overhead', 0.0))
+      if overhead > 0:
+        if overhead <= 1.0:
+          overhead_bytes = int(fw_peak * overhead)
+        else:
+          overhead_bytes = int(overhead)
+      else:
+        overhead_bytes = 0
+      return fw_peak + overhead_bytes, 0
 
   def get_mem_tier1_cap_req(self):
     return self._get_mem_cap_reqs()[0]

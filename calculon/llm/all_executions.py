@@ -102,14 +102,23 @@ class AllExecutions(calculon.CommandLine):
                                 for tn in pick(tp>1, range(num_nets), [0]):
                                   for pn in pick(pp>1, range(num_nets), [0]):
                                     for dn in pick(dp>1, range(num_nets), [0]):
-                                      yield (num_procs, tp, pp, dp, tn, pn, dn,
-                                             batch_size, microbatch_size, datatype,
-                                             fused_act, True, 'multihead', activation_recompute,
-                                             ppint, optimizer_sharding, tensor_par_comm_type,
-                                             tensor_par_overlap, seq_par_ag_redo,
-                                             data_par_overlap, weight_offload,
-                                             activations_offload, optimizer_offload,
-                                             True, True)
+                                      # yield full execution tuple including new defaults
+                                      yield (
+                                        num_procs, tp, pp, dp, tn, pn, dn,
+                                        batch_size, microbatch_size, datatype,
+                                        fused_act, True, 'multihead', activation_recompute,
+                                        ppint, optimizer_sharding, tensor_par_comm_type,
+                                        tensor_par_overlap, seq_par_ag_redo,
+                                        data_par_overlap, weight_offload,
+                                        activations_offload, optimizer_offload,
+                                        True, True,
+                                        # new defaults for additional modelling knobs
+                                        1,  # pseudo_free_level
+                                        0,  # pseudo_free_tmp_level
+                                        1.0, # working_peak_scale
+                                        0.0, # allocator_overhead
+                                        False  # enable_offload_modeling
+                                      )
                                       count += 1
 
   @staticmethod

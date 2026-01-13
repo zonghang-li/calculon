@@ -328,6 +328,11 @@ class OptimalExecution(calculon.CommandLine):
                       'weight_offload': weight_offload,
                       'activations_offload': activations_offload,
                       'optimizer_offload': optimizer_offload,
+                      # Estimator knobs to better match Megatron runtime freeing
+                      'pseudo_free_level': 1,
+                      'pseudo_free_tmp_level': 0,
+                      'working_peak_scale': 1.0,
+                      'allocator_overhead': 0.0,
                       'training': True
                     }
                     if not debug:
