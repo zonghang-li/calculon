@@ -81,15 +81,15 @@ For a layer with `weight_space` parameters:
 ```python
 def get_optimizer(self):
     # Adam moments: 2 moments * weight_space * 4 bytes (FP32)
-    moments_size = optim_space * 4
+    moments_size = self.optim_space * 4
     
     # Master copy: only if training in lower precision than FP32
-    if bytes_per_element < 4:
-        master_copy_size = weight_space * 4
+    if self.bytes_per_element < 4:
+        master_copy_size = self.weight_space * 4
     else:
         master_copy_size = 0
     
-    return (master_copy_size + moments_size) / optim_sharding_num_proc
+    return (master_copy_size + moments_size) / self.optim_sharding_num_proc
 ```
 
 Where `optim_space = 2 * weight_space` (for the two Adam moments).
@@ -164,8 +164,8 @@ The static memory calculation directly affects:
 
 ## Key Code Locations
 
-- **Weight space calculation**: `calculon/llm/llm.py`, lines 2331-2453
-- **Optimizer space calculation**: `calculon/llm/llm.py`, lines 2421-2453
+- **Weight space calculation**: `calculon/llm/llm.py`, lines 2331-2434 (blocks) and 2434-2453 (embeddings)
+- **Optimizer space calculation**: `calculon/llm/llm.py`, lines 2421-2422 (blocks) and 2443-2445, 2451-2453 (embeddings)
 - **Per-layer optimizer**: `calculon/llm/layers.py`, lines 283-291
 - **Memory capacity check**: `calculon/llm/llm.py`, lines 2455-2465
 
