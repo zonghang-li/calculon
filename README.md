@@ -48,6 +48,12 @@ To validate Calculon performance modeling against Megatron run on NVIDIA's Selen
 $> PYTHONPATH=. ./bin/calculon llm-validation
 ```
 
+## Documentation
+
+For detailed information about how Calculon calculates memory requirements:
+
+* [Static Memory Calculation](STATIC_MEMORY_CALCULATION.md) - Explains how model weights and optimizer state memory are calculated
+
 ## Publications
 
 * Calculon: A Methodology and Tool for High-Level Co-Design of Systems and Large Language Models\
